@@ -402,6 +402,37 @@ async function call(method, url, body, token, extraHeaders = {}) {
     'x-srok-sig': stateEnv.sig,
   });
   check('container syncs to newer 100 riel and deducts seed price (100 - 3 = 97)', r.status === 200 && r.data.riel === 97);
+  check('mutating action advances updatedAt timestamp', Number(r.data.updatedAt) >= Number(stateEnv.updatedAt));
+
+  console.log('cold-container vault header recovery & unicode support');
+  const khmerVault = {
+    username: 'statetest',
+    name: 'សុខា កសិករ',
+    look: { skin: 1, hair: 2, outfit: 3 },
+    riel: 500,
+    xp: 200,
+    plots: [],
+    inv: { crops: { rice: 5 }, fish: {}, products: {} },
+    decor: { owned: {}, placed: [] },
+    animals: [],
+    friends: [],
+    gifts: {},
+    salt: db.users.statetest.salt,
+    hash: db.users.statetest.hash,
+    updatedAt: Date.now() + 20000,
+  };
+  const vaultB64 = Buffer.from(JSON.stringify(khmerVault), 'utf8').toString('base64');
+
+  // Completely wipe statetest from container db memory to simulate cold start without disk state
+  delete db.users.statetest;
+
+  // Make request with bearer token and x-srok-vault
+  r = await call('GET', '/api/me', undefined, testTok, {
+    'x-srok-vault': vaultB64,
+  });
+  check('cold container recovers user from x-srok-vault', r.status === 200 && r.data.username === 'statetest');
+  check('recovered user retains Khmer display name', r.data.name === 'សុខា កសិករ');
+  check('recovered user retains correct riel count (500)', r.data.riel === 500);
 
   console.log(`\nAll ${passed} checks passed successfully.`);
   process.exit(0);

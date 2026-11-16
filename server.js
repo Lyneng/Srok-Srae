@@ -759,8 +759,7 @@ function newUser(username, name, look, salt, hash) {
 
 const TOKEN_SECRET =
   process.env.SESSION_SECRET ||
-  process.env.VERCEL_GIT_COMMIT_SHA ||
-  "srok-srae-session-secret-2025";
+  "srok-srae-session-secret-khmer-farming-game-2025";
 
 function signState(u) {
   const obj = {
@@ -812,7 +811,7 @@ function verifyState(payloadB64, sig) {
 }
 
 function view(u, now = Date.now()) {
-  if (!u.updatedAt) u.updatedAt = now;
+  u.updatedAt = Math.max(Number(u.updatedAt) || 0, 1);
   const stateEnv = signState(u);
   return {
     username: u.username,
@@ -833,6 +832,14 @@ function view(u, now = Date.now()) {
     _state: stateEnv,
     serverNow: now,
   };
+}
+
+function touch(u, now = Date.now()) {
+  if (u) {
+    u.updatedAt = Math.max(Number(u.updatedAt) || 0, now);
+    u.lastSeen = now;
+  }
+  saveNow();
 }
 
 function createSessionToken(username) {
@@ -889,13 +896,32 @@ function authUser(req) {
     if (verified && verified.username === s.username) {
       const current = db.users[s.username];
       const verifiedAt = Number(verified.updatedAt) || 0;
-      const currentAt = Number(
-        current ? current.updatedAt || current.lastSeen || 0 : 0,
-      );
+      const currentAt = Number(current ? current.updatedAt || 0 : 0);
       if (!current || verifiedAt > currentAt) {
         db.users[s.username] = ensureUser(verified);
         saveNow();
       }
+    }
+  }
+
+  // Cold container recovery using vault header if container lacks user data
+  if (!db.users[s.username]) {
+    const vaultHeader = req.headers["x-srok-vault"];
+    if (typeof vaultHeader === "string" && vaultHeader) {
+      try {
+        const parsedVault = JSON.parse(
+          Buffer.from(vaultHeader, "base64").toString("utf8")
+        );
+        if (
+          parsedVault &&
+          parsedVault.username === s.username &&
+          parsedVault.hash &&
+          parsedVault.salt
+        ) {
+          db.users[s.username] = ensureUser(parsedVault);
+          saveNow();
+        }
+      } catch {}
     }
   }
 
@@ -1098,7 +1124,7 @@ async function api(req, res, url) {
       watered: false,
       fert: false,
     };
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1114,7 +1140,7 @@ async function api(req, res, url) {
     const saveRate = SHOP.canSave[(u.canLevel || 1) - 1] ?? SHOP.canSave[0];
     const remaining = Math.max(0, p.readyAt - now);
     p.readyAt = now + Math.round(remaining * (1 - saveRate));
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1131,7 +1157,7 @@ async function api(req, res, url) {
     p.fert = true;
     const remaining = Math.max(0, p.readyAt - now);
     p.readyAt = now + Math.round(remaining * 0.5);
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1145,13 +1171,13 @@ async function api(req, res, url) {
     const crop = CROPS[p.crop];
     if (!crop) {
       u.plots[b.plot] = null;
-      saveNow();
+      touch(u, now);
       return fail(res, 400, "bad_crop");
     }
     u.inv.crops[crop.id] = (u.inv.crops[crop.id] || 0) + 1;
     u.xp += crop.xp || 0;
     u.plots[b.plot] = null;
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1172,7 +1198,7 @@ async function api(req, res, url) {
     const total = Math.floor(base * (1 + bonus));
     u.inv = { crops: {}, fish: {}, products: {} };
     u.riel += total;
-    saveNow();
+    touch(u, now);
     return send(res, 200, { ...view(u, now), sold: total, bonus });
   }
 
@@ -1184,7 +1210,7 @@ async function api(req, res, url) {
     if (u.riel < step.price) return fail(res, 402, "not_enough_riel");
     u.riel -= step.price;
     while (u.plots.length < step.plots) u.plots.push(null);
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1196,7 +1222,7 @@ async function api(req, res, url) {
     if (u.riel < cost) return fail(res, 402, "not_enough_riel");
     u.riel -= cost;
     u.fert += qty;
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1207,7 +1233,7 @@ async function api(req, res, url) {
     if (u.riel < up.price) return fail(res, 402, "not_enough_riel");
     u.riel -= up.price;
     u.canLevel += 1;
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1223,7 +1249,7 @@ async function api(req, res, url) {
     if (u.riel < d.price) return fail(res, 402, "not_enough_riel");
     u.riel -= d.price;
     u.decor.owned[d.id] = (u.decor.owned[d.id] || 0) + 1;
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1239,7 +1265,7 @@ async function api(req, res, url) {
       if (free < 1) return fail(res, 409, "not_owned");
       u.decor.placed[b.slot] = b.id;
     }
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1254,7 +1280,7 @@ async function api(req, res, url) {
     if (u.riel < a.price) return fail(res, 402, "not_enough_riel");
     u.riel -= a.price;
     u.animals.push({ type: a.id, readyAt: null });
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1271,7 +1297,7 @@ async function api(req, res, url) {
     u.riel -= def.feed;
     const dur = Math.round(def.time * SPEED);
     an.readyAt = now + dur;
-    saveNow();
+    touch(u, now);
     return send(res, 200, view(u, now));
   }
 
@@ -1291,7 +1317,7 @@ async function api(req, res, url) {
     else u.inv.products[prod.id] = (u.inv.products[prod.id] || 0) + 1;
     u.xp += 2;
     an.readyAt = null;
-    saveNow();
+    touch(u, now);
     return send(res, 200, { ...view(u, now), product: prod.id });
   }
 
@@ -1311,7 +1337,7 @@ async function api(req, res, url) {
     u.gifts[ev.id] = today;
     u.riel += ev.giftRiel || 0;
     u.fert += 1;
-    saveNow();
+    touch(u, now);
     return send(res, 200, {
       ...view(u, now),
       gift: { riel: ev.giftRiel || 0, fert: 1 },
@@ -1324,7 +1350,7 @@ async function api(req, res, url) {
       FISH_MIN_DELAY +
       Math.floor(Math.random() * (FISH_MAX_DELAY - FISH_MIN_DELAY));
     u.fish = { biteAt: now + delay };
-    saveNow();
+    touch(u, now);
     return send(res, 200, { delay, window: FISH_WINDOW });
   }
 
@@ -1334,11 +1360,11 @@ async function api(req, res, url) {
     if (!f || typeof f.biteAt !== "number")
       return fail(res, 409, "not_fishing");
     if (now < f.biteAt) {
-      saveNow();
+      touch(u, now);
       return send(res, 200, { result: "early" });
     }
     if (now > f.biteAt + FISH_WINDOW + FISH_LATENCY_SLACK) {
-      saveNow();
+      touch(u, now);
       return send(res, 200, { result: "missed" });
     }
     const luck = bonuses(now).fishLuck || 1;
@@ -1354,7 +1380,7 @@ async function api(req, res, url) {
     }
     u.inv.fish[caught.id] = (u.inv.fish[caught.id] || 0) + 1;
     u.xp += 1;
-    saveNow();
+    touch(u, now);
     return send(res, 200, {
       result: "caught",
       fish: caught.id,
@@ -1387,7 +1413,7 @@ async function api(req, res, url) {
     if (u.friends.includes(name)) return fail(res, 409, "already_friends");
     if (u.friends.length >= 100) return fail(res, 400, "too_many_friends");
     u.friends.push(name);
-    saveNow();
+    touch(u, now);
     return send(res, 200, { ok: true, me: view(u, now) });
   }
 
@@ -1396,7 +1422,7 @@ async function api(req, res, url) {
     const raw = typeof b.username === "string" ? b.username : "";
     const name = raw.toLowerCase().trim();
     u.friends = u.friends.filter((n) => n !== name);
-    saveNow();
+    touch(u, now);
     return send(res, 200, { ok: true, me: view(u, now) });
   }
 

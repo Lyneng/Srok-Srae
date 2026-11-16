@@ -173,8 +173,48 @@
   const srvNow = () => Date.now() + S.offset;
 
   /* ------------------------------------------------------------------ */
-  /* api                                                                 */
+  /* api & crypto utils                                                  */
   /* ------------------------------------------------------------------ */
+  function toBase64(str) {
+    try {
+      return btoa(
+        encodeURIComponent(str).replace(/%([0-9A-F]{2})/g, (_, p1) =>
+          String.fromCharCode('0x' + p1)
+        )
+      );
+    } catch {
+      return '';
+    }
+  }
+
+  function fromBase64(b64) {
+    try {
+      return decodeURIComponent(
+        Array.prototype.map
+          .call(atob(b64), (c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+          .join('')
+      );
+    } catch {
+      return '';
+    }
+  }
+
+  function getSessionUsername() {
+    if (S.me && S.me.username) return S.me.username.toLowerCase().trim();
+    if (S.token) {
+      const parts = S.token.split('.');
+      if (parts.length >= 2 && parts[1]) {
+        try {
+          return decodeURIComponent(parts[1]).toLowerCase().trim();
+        } catch {
+          return parts[1].toLowerCase().trim();
+        }
+      }
+    }
+    const u = S.form.username || localStorage.getItem('last_user') || '';
+    return u.toLowerCase().trim();
+  }
+
   function getStateEnv(username) {
     if (!username) return null;
     try {
@@ -188,12 +228,17 @@
   async function api(path, body) {
     const opts = { headers: {} };
     if (S.token) opts.headers.Authorization = 'Bearer ' + S.token;
-    const user = (S.me && S.me.username) || S.form.username || localStorage.getItem('last_user') || '';
+    const user = getSessionUsername();
     if (user) {
       const env = getStateEnv(user);
       if (env && env.payload && env.sig) {
         opts.headers['x-srok-state'] = env.payload;
         opts.headers['x-srok-sig'] = env.sig;
+      }
+      const vault = getVault(user);
+      if (vault) {
+        const vaultB64 = toBase64(JSON.stringify(vault));
+        if (vaultB64) opts.headers['x-srok-vault'] = vaultB64;
       }
     }
     if (body !== undefined) {
@@ -230,7 +275,8 @@
   function saveVault(u, authVault) {
     if (!u || !u.username) return;
     try {
-      const key = 'srok_vault_' + u.username.toLowerCase();
+      const username = u.username.toLowerCase().trim();
+      const key = 'srok_vault_' + username;
       let existing = {};
       try { existing = JSON.parse(localStorage.getItem(key)) || {}; } catch {}
       // Monotonic guard: never overwrite newer local vault with older server state
@@ -241,13 +287,13 @@
         ...existing,
         ...u,
         ...(authVault || {}),
-        updatedAt: u.updatedAt || Date.now(),
+        updatedAt: u.updatedAt || existing.updatedAt || Date.now(),
       };
       localStorage.setItem(key, JSON.stringify(merged));
-      localStorage.setItem('last_user', u.username.toLowerCase());
+      localStorage.setItem('last_user', username);
       if (u._state) {
         localStorage.setItem(
-          'srok_state_' + u.username.toLowerCase(),
+          'srok_state_' + username,
           JSON.stringify(u._state)
         );
       }
@@ -264,15 +310,17 @@
     }
   }
 
-  function setMe(me, authVault) {
-    if (!me) return;
+  function setMe(data, authVault) {
+    if (!data) return;
+    const me = (data.me && typeof data.me === 'object' && data.me.username) ? data.me : data;
+    if (!me || !me.username) return;
     // Monotonic guard: never allow older server state to overwrite newer client state
     if (S.me && me.updatedAt && S.me.updatedAt && me.updatedAt < S.me.updatedAt) {
       return;
     }
     const before = S.me ? S.me.level : null;
     S.me = me;
-    S.offset = me.serverNow - Date.now();
+    S.offset = (me.serverNow || Date.now()) - Date.now();
     if (before !== null && me.level > before) toast('🎉 ' + t('levelUp'));
     saveVault(me, authVault);
   }
@@ -493,17 +541,22 @@
 
   function renderHeader() {
     const me = S.me;
-    const lvStart = 25 * (me.level - 1) ** 2;
-    const lvEnd = 25 * me.level ** 2;
-    const pct = Math.max(0, Math.min(100, ((me.xp - lvStart) / (lvEnd - lvStart)) * 100));
-    $('#top').innerHTML = `
-      ${avatar(me.look, 44)}
+    if (!me) return;
+    const lv = Number(me.level) || 1;
+    const xp = Number(me.xp) || 0;
+    const lvStart = 25 * (lv - 1) ** 2;
+    const lvEnd = 25 * lv ** 2;
+    const pct = Math.max(0, Math.min(100, ((xp - lvStart) / (lvEnd - lvStart)) * 100));
+    const topEl = $('#top');
+    if (!topEl) return;
+    topEl.innerHTML = `
+      ${avatar(me.look || { skin: 0, hair: 0, outfit: 0 }, 44)}
       <div class="who">
-        <b>${esc(me.name)}</b>
-        <small>${t('level')} ${me.level}</small>
+        <b>${esc(me.name || me.username || '')}</b>
+        <small>${t('level')} ${lv}</small>
         <div class="xpbar"><i style="width:${pct}%"></i></div>
       </div>
-      <span class="pill" title="${t('riel')}">💰 ${me.riel} ${t('riel')}</span>
+      <span class="pill" title="${t('riel')}">💰 ${typeof me.riel === 'number' ? me.riel : 0} ${t('riel')}</span>
       <button class="pill" id="langBtn" type="button">${S.lang === 'km' ? 'EN' : 'ខ្មែរ'}</button>
       <button class="pill" id="logoutBtn" type="button" title="${t('logout')}" aria-label="${t('logout')}">⎋</button>`;
   }
@@ -681,7 +734,7 @@
     S.busy = true;
     try {
       const r = await api(path, body);
-      setMe(r.me && r.result ? r.me : r);
+      setMe(r);
       renderHeader();
       if (after) after(r);
       return r;
@@ -1274,6 +1327,16 @@
   /* ------------------------------------------------------------------ */
   async function boot() {
     document.documentElement.lang = S.lang === 'km' ? 'km' : 'en';
+
+    // Hydrate immediately from vault on refresh if session exists
+    const activeUser = getSessionUsername();
+    if (S.token && activeUser) {
+      const cached = getVault(activeUser);
+      if (cached && cached.username === activeUser) {
+        S.me = cached;
+      }
+    }
+
     app.innerHTML = `<div class="auth"><div class="logo"><h1>🌾</h1><p>${t('loading')}</p></div></div>`;
     try {
       S.cfg = await api('/api/config');
@@ -1283,7 +1346,8 @@
     }
     if (S.token) {
       try {
-        setMe(await api('/api/me'));
+        const me = await api('/api/me');
+        setMe(me);
         enterGame();
         return;
       } catch {
