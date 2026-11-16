@@ -491,6 +491,7 @@ function ensureUser(u) {
   u.lastSeen = Number(u.lastSeen) || Date.now();
   u.lastChat = Number(u.lastChat) || 0;
   u.created = Number(u.created) || Date.now();
+  u.updatedAt = Number(u.updatedAt) || u.lastSeen || Date.now();
 
   return u;
 }
@@ -752,10 +753,67 @@ function newUser(username, name, look, salt, hash) {
     lastSeen: Date.now(),
     lastChat: 0,
     created: Date.now(),
+    updatedAt: Date.now(),
   });
 }
 
+const TOKEN_SECRET =
+  process.env.SESSION_SECRET ||
+  process.env.VERCEL_GIT_COMMIT_SHA ||
+  "srok-srae-session-secret-2025";
+
+function signState(u) {
+  const obj = {
+    username: u.username,
+    name: u.name,
+    look: u.look,
+    riel: u.riel,
+    xp: u.xp,
+    canLevel: u.canLevel,
+    fert: u.fert,
+    plots: u.plots,
+    inv: u.inv,
+    decor: u.decor,
+    animals: u.animals,
+    friends: u.friends || [],
+    gifts: u.gifts || {},
+    salt: u.salt,
+    hash: u.hash,
+    updatedAt: u.updatedAt || Date.now(),
+  };
+  const json = JSON.stringify(obj);
+  const payload = Buffer.from(json, "utf8").toString("base64");
+  const sig = crypto
+    .createHmac("sha256", TOKEN_SECRET)
+    .update(payload)
+    .digest("hex");
+  return { payload, sig, updatedAt: obj.updatedAt };
+}
+
+function verifyState(payloadB64, sig) {
+  if (typeof payloadB64 !== "string" || typeof sig !== "string") return null;
+  const expectedSig = crypto
+    .createHmac("sha256", TOKEN_SECRET)
+    .update(payloadB64)
+    .digest("hex");
+  if (
+    sig.length !== expectedSig.length ||
+    !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))
+  ) {
+    return null;
+  }
+  try {
+    const json = Buffer.from(payloadB64, "base64").toString("utf8");
+    const parsed = JSON.parse(json);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function view(u, now = Date.now()) {
+  if (!u.updatedAt) u.updatedAt = now;
+  const stateEnv = signState(u);
   return {
     username: u.username,
     name: u.name,
@@ -771,14 +829,11 @@ function view(u, now = Date.now()) {
     animals: u.animals,
     friends: u.friends || [],
     gifts: u.gifts || {},
+    updatedAt: u.updatedAt,
+    _state: stateEnv,
     serverNow: now,
   };
 }
-
-const TOKEN_SECRET =
-  process.env.SESSION_SECRET ||
-  process.env.VERCEL_GIT_COMMIT_SHA ||
-  "srok-srae-session-secret-2025";
 
 function createSessionToken(username) {
   const nonce = crypto.randomBytes(16).toString("hex");
@@ -825,6 +880,25 @@ function authUser(req) {
   }
   if (!s || typeof s !== "object" || s.revoked || !s.username) return null;
   maybeReloadDb();
+
+  // Cross-container cryptographic state sync
+  const statePayload = req.headers["x-srok-state"];
+  const stateSig = req.headers["x-srok-sig"];
+  if (typeof statePayload === "string" && typeof stateSig === "string") {
+    const verified = verifyState(statePayload, stateSig);
+    if (verified && verified.username === s.username) {
+      const current = db.users[s.username];
+      const verifiedAt = Number(verified.updatedAt) || 0;
+      const currentAt = Number(
+        current ? current.updatedAt || current.lastSeen || 0 : 0,
+      );
+      if (!current || verifiedAt > currentAt) {
+        db.users[s.username] = ensureUser(verified);
+        saveNow();
+      }
+    }
+  }
+
   const u = db.users[s.username];
   if (!u) return null;
   u.lastSeen = Date.now();

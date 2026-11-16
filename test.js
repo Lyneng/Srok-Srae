@@ -73,9 +73,9 @@ class MockRes extends EventEmitter {
   }
 }
 
-async function call(method, url, body, token) {
+async function call(method, url, body, token, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
-    const headers = { 'content-type': 'application/json' };
+    const headers = { 'content-type': 'application/json', ...extraHeaders };
     if (token) headers.authorization = 'Bearer ' + token;
     const req = new MockReq(method, url, body, headers);
     const res = new MockRes();
@@ -379,6 +379,29 @@ async function call(method, url, body, token) {
   check('restore caps over-limit plots to 24', r.status === 200 && r.data.me.plots.length === 24);
   check('restore caps over-limit riel', r.data.me.riel === 100000000);
   check('restore deduplicates friends', r.data.me.friends.length === 2);
+
+  console.log('cross-container cryptographic state sync');
+  r = await call('POST', '/api/register', { username: 'statetest', password: 'secret1' });
+  const testTok = r.data.token;
+  check('view includes _state signature', !!r.data.me._state && !!r.data.me._state.payload && !!r.data.me._state.sig);
+
+  // Player earns riel (e.g. 100 riel) on container 1
+  db.users.statetest.riel = 100;
+  db.users.statetest.updatedAt = Date.now() + 5000;
+  const view1 = (await call('GET', '/api/me', undefined, testTok)).data;
+  check('statetest has 100 riel', view1.riel === 100);
+  const stateEnv = view1._state;
+
+  // Now simulate container 2 that only has old stale state (50 riel)
+  db.users.statetest.riel = 50;
+  db.users.statetest.updatedAt = Date.now() - 10000;
+
+  // Next request passes x-srok-state and x-srok-sig from container 1
+  r = await call('POST', '/api/plant', { plot: 0, crop: 'morning_glory' }, testTok, {
+    'x-srok-state': stateEnv.payload,
+    'x-srok-sig': stateEnv.sig,
+  });
+  check('container syncs to newer 100 riel and deducts seed price (100 - 3 = 97)', r.status === 200 && r.data.riel === 97);
 
   console.log(`\nAll ${passed} checks passed successfully.`);
   process.exit(0);

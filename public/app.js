@@ -175,9 +175,27 @@
   /* ------------------------------------------------------------------ */
   /* api                                                                 */
   /* ------------------------------------------------------------------ */
+  function getStateEnv(username) {
+    if (!username) return null;
+    try {
+      const raw = localStorage.getItem('srok_state_' + username.toLowerCase().trim());
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function api(path, body) {
     const opts = { headers: {} };
     if (S.token) opts.headers.Authorization = 'Bearer ' + S.token;
+    const user = (S.me && S.me.username) || S.form.username || localStorage.getItem('last_user') || '';
+    if (user) {
+      const env = getStateEnv(user);
+      if (env && env.payload && env.sig) {
+        opts.headers['x-srok-state'] = env.payload;
+        opts.headers['x-srok-sig'] = env.sig;
+      }
+    }
     if (body !== undefined) {
       opts.method = 'POST';
       opts.headers['Content-Type'] = 'application/json';
@@ -215,14 +233,24 @@
       const key = 'srok_vault_' + u.username.toLowerCase();
       let existing = {};
       try { existing = JSON.parse(localStorage.getItem(key)) || {}; } catch {}
+      // Monotonic guard: never overwrite newer local vault with older server state
+      if (existing.updatedAt && u.updatedAt && u.updatedAt < existing.updatedAt) {
+        return;
+      }
       const merged = {
         ...existing,
         ...u,
         ...(authVault || {}),
-        updatedAt: Date.now(),
+        updatedAt: u.updatedAt || Date.now(),
       };
       localStorage.setItem(key, JSON.stringify(merged));
       localStorage.setItem('last_user', u.username.toLowerCase());
+      if (u._state) {
+        localStorage.setItem(
+          'srok_state_' + u.username.toLowerCase(),
+          JSON.stringify(u._state)
+        );
+      }
     } catch {}
   }
 
@@ -237,6 +265,11 @@
   }
 
   function setMe(me, authVault) {
+    if (!me) return;
+    // Monotonic guard: never allow older server state to overwrite newer client state
+    if (S.me && me.updatedAt && S.me.updatedAt && me.updatedAt < S.me.updatedAt) {
+      return;
+    }
     const before = S.me ? S.me.level : null;
     S.me = me;
     S.offset = me.serverNow - Date.now();
@@ -415,7 +448,7 @@
   function startLoops() {
     stopLoops();
     timers.push(setInterval(tick, 1000));
-    timers.push(setInterval(refreshMe, 15000));
+    timers.push(setInterval(refreshMe, 60000));
     timers.push(setInterval(pollChat, 3000));
     timers.push(setInterval(loadEvents, 60000));
     timers.push(setInterval(() => { if (S.tab === 'social' && S.sub.social === 'friends' && !S.visit) loadFriends(); }, 20000));
@@ -1286,6 +1319,12 @@
           if (S.tab === 'farm') updateFarm();
         }
       } catch {}
+    }
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && S.token && S.me) {
+      refreshMe();
     }
   });
 
