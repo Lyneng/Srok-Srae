@@ -1,0 +1,14 @@
+{
+  "name": "ស្រុកស្រែ · Srok Srae",
+  "short_name": "ស្រុកស្រែ",
+  "description": "A Khmer social farming game",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#e3f4ff",
+  "theme_color": "#2e7d32",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

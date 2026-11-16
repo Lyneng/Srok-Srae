@@ -1,0 +1,14 @@
+{
+  "name": "srok-srae",
+  "version": "0.1.0",
+  "description": "ស្រុកស្រែ - a Khmer social farming web game (no dependencies)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "GROWTH_SPEED=0.1 node server.js",
+    "test": "node test.js"
+  },
+  "engines": { "node": ">=18" },
+  "license": "UNLICENSED",
+  "private": true
+}

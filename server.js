@@ -1,0 +1,722 @@
+'use strict';
+/*
+ * Srok Srae (ស្រុកស្រែ) - a small social farming game server.
+ * Zero dependencies: only Node.js built-ins (Node 18+).
+ *
+ *   node server.js                       -> http://localhost:3000
+ *   PORT=8080 node server.js
+ *   GROWTH_SPEED=0.1 node server.js      (crops/animals 10x faster, for testing)
+ *   FORCE_EVENT=water_festival node server.js   (turn an event on, for testing)
+ */
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const PORT = Number(process.env.PORT || 3000);
+const SPEED = Number(process.env.GROWTH_SPEED || 1);
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
+const FORCE_EVENTS = (process.env.FORCE_EVENT || '').split(',').map((s) => s.trim()).filter(Boolean);
+const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'db.json');
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const EVENTS_FILE = path.join(__dirname, 'events.json');
+
+/* ------------------------------------------------------------------ */
+/* Game configuration (sent to the client via /api/config)             */
+/* ------------------------------------------------------------------ */
+const PLOT_START = 12;
+const START_RIEL = 50;
+const YARD_SLOTS = 12;
+const PEN_CAP = 6;
+
+const CROPS = {
+  morning_glory: { id: 'morning_glory', emoji: '🥬', seed: 3,  sell: 7,  time: 30000,  xp: 2,  level: 1 },
+  rice:          { id: 'rice',          emoji: '🌾', seed: 5,  sell: 12, time: 45000,  xp: 3,  level: 1 },
+  lotus:         { id: 'lotus',         emoji: '🪷', seed: 12, sell: 30, time: 90000,  xp: 6,  level: 2 },
+  mango:         { id: 'mango',         emoji: '🥭', seed: 25, sell: 70, time: 150000, xp: 12, level: 3 },
+};
+
+const FISH = {
+  riel:      { id: 'riel',      emoji: '🐟', sell: 8,  weight: 60 },
+  snakehead: { id: 'snakehead', emoji: '🐠', sell: 20, weight: 30 },
+  catfish:   { id: 'catfish',   emoji: '🐡', sell: 50, weight: 10 },
+};
+
+// Farm shop
+const SHOP = {
+  land: [ // each step adds 4 plots
+    { plots: 16, price: 150, level: 2 },
+    { plots: 20, price: 400, level: 3 },
+    { plots: 24, price: 900, level: 4 },
+  ],
+  fertPrice: 15,
+  canSave: [0.2, 0.3, 0.4],              // share of remaining time saved by watering, per can level
+  canUpgrades: [{ price: 200, level: 2 }, { price: 600, level: 4 }], // to reach can level 2 and 3
+};
+
+// Decorations for the village yard
+const DECOR = {
+  flower:     { id: 'flower',     emoji: '🌺', price: 20,  level: 1, name: { km: 'ផ្កា', en: 'Flowers' } },
+  palm:       { id: 'palm',       emoji: '🌴', price: 40,  level: 1, name: { km: 'ដើមត្នោត', en: 'Palm tree' } },
+  lantern:    { id: 'lantern',    emoji: '🏮', price: 35,  level: 1, name: { km: 'ចង្កៀង', en: 'Lantern' } },
+  bicycle:    { id: 'bicycle',    emoji: '🚲', price: 60,  level: 2, name: { km: 'កង់', en: 'Bicycle' } },
+  pond:       { id: 'pond',       emoji: '🪷', price: 90,  level: 2, name: { km: 'ស្រះឈូក', en: 'Lotus pond' } },
+  house:      { id: 'house',      emoji: '🏠', price: 120, level: 2, name: { km: 'ផ្ទះ', en: 'House' } },
+  tuktuk:     { id: 'tuktuk',     emoji: '🛺', price: 150, level: 3, name: { km: 'តុកតុក', en: 'Tuk-tuk' } },
+  fountain:   { id: 'fountain',   emoji: '⛲', price: 180, level: 3, name: { km: 'ប្រភពទឹក', en: 'Fountain' } },
+  bridge:     { id: 'bridge',     emoji: '🌉', price: 200, level: 3, name: { km: 'ស្ពាន', en: 'Bridge' } },
+  elephant:   { id: 'elephant',   emoji: '🐘', price: 300, level: 4, name: { km: 'ដំរី', en: 'Elephant statue' } },
+  pagoda:     { id: 'pagoda',     emoji: '🛕', price: 400, level: 4, name: { km: 'វត្ត', en: 'Pagoda' } },
+  // event-only (id must be listed in an event's "items" in events.json)
+  sand_mound:  { id: 'sand_mound',  emoji: '⛰️', price: 80, level: 1, event: true, name: { km: 'ភ្នំខ្សាច់', en: 'Sand mound' } },
+  plough_ox:   { id: 'plough_ox',   emoji: '🐂', price: 80, level: 1, event: true, name: { km: 'គោភ្ជួរស្រែ', en: 'Plough ox' } },
+  candle:      { id: 'candle',      emoji: '🕯️', price: 60, level: 1, event: true, name: { km: 'ទៀន', en: 'Candle' } },
+  racing_boat: { id: 'racing_boat', emoji: '🛶', price: 120, level: 1, event: true, name: { km: 'ទូកអុំ', en: 'Racing boat' } },
+  moon:        { id: 'moon',        emoji: '🌕', price: 70, level: 1, event: true, name: { km: 'ព្រះចន្ទ', en: 'Full moon' } },
+};
+
+// Animals: feed them, wait, collect the product
+const PRODUCTS = {
+  egg:      { id: 'egg',      emoji: '🥚', sell: 9,  name: { km: 'ពងមាន់', en: 'Chicken egg' } },
+  duck_egg: { id: 'duck_egg', emoji: '🥚', sell: 16, name: { km: 'ពងទា', en: 'Duck egg' } },
+  milk:     { id: 'milk',     emoji: '🥛', sell: 60, name: { km: 'ទឹកដោះក្របី', en: 'Buffalo milk' } },
+  manure:   { id: 'manure',   emoji: '🌿', sell: 0,  fertilizer: true, name: { km: 'ជី', en: 'Fertilizer' } },
+};
+const ANIMALS = {
+  chicken: { id: 'chicken', emoji: '🐔', price: 40,  level: 2, feed: 2,  time: 60000,  product: 'egg',      name: { km: 'មាន់', en: 'Chicken' } },
+  duck:    { id: 'duck',    emoji: '🦆', price: 70,  level: 2, feed: 3,  time: 90000,  product: 'duck_egg', name: { km: 'ទា', en: 'Duck' } },
+  pig:     { id: 'pig',     emoji: '🐖', price: 150, level: 3, feed: 6,  time: 120000, product: 'manure',   name: { km: 'ជ្រូក', en: 'Pig' } },
+  buffalo: { id: 'buffalo', emoji: '🐃', price: 300, level: 4, feed: 10, time: 180000, product: 'milk',     name: { km: 'ក្របី', en: 'Buffalo' } },
+};
+
+const FISH_MIN_DELAY = 2000;
+const FISH_MAX_DELAY = 6000;
+const FISH_WINDOW = 1500;
+const FISH_LATENCY_SLACK = 400;
+
+const LOOK_LIMITS = { skin: 5, hair: 6, outfit: 6 };
+const levelFor = (xp) => Math.floor(Math.sqrt(xp / 25)) + 1;
+
+/* ------------------------------------------------------------------ */
+/* Events (loaded from events.json)                                    */
+/* ------------------------------------------------------------------ */
+let EVENTS = [];
+try {
+  EVENTS = JSON.parse(fs.readFileSync(EVENTS_FILE, 'utf8')).events || [];
+} catch (e) {
+  console.error('Could not read events.json, running without events:', e.message);
+}
+
+const khDate = (ms) => new Date(ms + 7 * 3600 * 1000).toISOString().slice(0, 10); // YYYY-MM-DD in Cambodia
+const dayStart = (d) => Date.parse(d + 'T00:00:00+07:00');
+const dayEnd = (d) => Date.parse(d + 'T23:59:59.999+07:00');
+
+function eventWindows(ev, now) {
+  const out = (ev.windows || []).map(([start, end]) => ({ start, end }));
+  if (ev.yearly) {
+    const y = Number(khDate(now).slice(0, 4));
+    for (const yr of [y, y + 1]) out.push({ start: `${yr}-${ev.yearly[0]}`, end: `${yr}-${ev.yearly[1]}` });
+  }
+  return out;
+}
+
+function eventStatus(ev, now) {
+  const today = khDate(now);
+  let active = null, next = null;
+  for (const w of eventWindows(ev, now)) {
+    if (today >= w.start && today <= w.end) active = w;
+    else if (w.start > today && (!next || w.start < next.start)) next = w;
+  }
+  if (!active && FORCE_EVENTS.includes(ev.id)) active = { start: today, end: today };
+  return { active, next };
+}
+
+const activeEvents = (now) => EVENTS.filter((ev) => eventStatus(ev, now).active);
+
+function bonuses(now) {
+  const b = { sell: 0, growth: 1, fishLuck: 1 };
+  for (const ev of activeEvents(now)) {
+    b.sell += ev.sellBonus || 0;
+    b.growth *= ev.growth || 1;
+    b.fishLuck = Math.max(b.fishLuck, ev.fishLuck || 1);
+  }
+  return b;
+}
+
+function eventItemAvailable(id, now) {
+  return activeEvents(now).some((ev) => (ev.items || []).includes(id));
+}
+
+/* ------------------------------------------------------------------ */
+/* Tiny JSON "database" with debounced atomic saves                    */
+/* ------------------------------------------------------------------ */
+let db = { users: {}, sessions: {}, chatSeq: 0, chat: [] };
+
+function ensureUser(u) {
+  u.plots ||= [];
+  while (u.plots.length < PLOT_START) u.plots.push(null);
+  u.fert ||= 0;
+  u.canLevel ||= 1;
+  u.inv ||= {};
+  u.inv.crops ||= {}; u.inv.fish ||= {}; u.inv.products ||= {};
+  u.decor ||= { owned: {}, placed: [] };
+  u.decor.owned ||= {};
+  u.decor.placed ||= [];
+  while (u.decor.placed.length < YARD_SLOTS) u.decor.placed.push(null);
+  u.animals ||= [];
+  u.gifts ||= {};
+  u.friends ||= [];
+  return u;
+}
+
+function loadDb() {
+  try {
+    db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    db.users ||= {}; db.sessions ||= {}; db.chat ||= []; db.chatSeq ||= 0;
+    Object.values(db.users).forEach(ensureUser);
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error('Could not read database, starting empty:', e.message);
+  }
+}
+
+let saveTimer = null;
+function saveSoon() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(saveNow, 500);
+}
+function saveNow() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  try {
+    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    const tmp = DATA_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(db));
+    fs.renameSync(tmp, DATA_FILE);
+  } catch (e) {
+    console.error('Save failed:', e.message);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+const SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'same-origin',
+  'Content-Security-Policy':
+    "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+    "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'",
+};
+
+function send(res, code, obj) {
+  res.writeHead(code, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    ...SECURITY_HEADERS,
+  });
+  res.end(JSON.stringify(obj));
+}
+const fail = (res, code, error) => send(res, code, { error });
+
+function readJson(req) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > 10 * 1024) { reject(Object.assign(new Error('too_large'), { status: 413 })); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (!chunks.length) return resolve({});
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+      catch { reject(Object.assign(new Error('bad_json'), { status: 400 })); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function clientIp(req) {
+  if (TRUST_PROXY) {
+    const xf = req.headers['x-forwarded-for'];
+    if (xf) return String(xf).split(',')[0].trim();
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
+const hits = new Map();
+function rateLimited(key, max, windowMs) {
+  const now = Date.now();
+  let h = hits.get(key);
+  if (!h || now > h.reset) { h = { count: 0, reset: now + windowMs }; hits.set(key, h); }
+  h.count += 1;
+  return h.count > max;
+}
+setInterval(() => { const n = Date.now(); for (const [k, v] of hits) if (n > v.reset) hits.delete(k); }, 60000).unref();
+
+function scrypt(password, salt) {
+  return new Promise((resolve, reject) =>
+    crypto.scrypt(password, salt, 32, (err, key) => (err ? reject(err) : resolve(key))));
+}
+
+function cleanText(s, max) {
+  return String(s ?? '').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function newUser(username, name, look, salt, hash) {
+  return ensureUser({
+    username, name, look,
+    salt: salt.toString('hex'), hash: hash.toString('hex'),
+    riel: START_RIEL, xp: 0,
+    plots: [], inv: { crops: {}, fish: {}, products: {} },
+    friends: [], fish: null,
+    lastSeen: Date.now(), lastChat: 0, created: Date.now(),
+  });
+}
+
+function view(u, now = Date.now()) {
+  return {
+    username: u.username, name: u.name, look: u.look,
+    riel: u.riel, xp: u.xp, level: levelFor(u.xp),
+    plots: u.plots, inv: u.inv, fert: u.fert, canLevel: u.canLevel,
+    decor: u.decor, animals: u.animals,
+    serverNow: now,
+  };
+}
+
+function authUser(req) {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : '';
+  const s = token && db.sessions[token];
+  if (!s) return null;
+  const u = db.users[s.username];
+  if (!u) return null;
+  u.lastSeen = Date.now();
+  return u;
+}
+
+const isInt = (n, min, max) => Number.isInteger(n) && n >= min && n <= max;
+
+function placedCount(u, id, exceptSlot = -1) {
+  return u.decor.placed.reduce((n, x, i) => n + (x === id && i !== exceptSlot ? 1 : 0), 0);
+}
+
+function eventsView(u, now) {
+  const today = khDate(now);
+  return EVENTS.map((ev) => {
+    const { active, next } = eventStatus(ev, now);
+    const w = active || next;
+    return {
+      id: ev.id, emoji: ev.emoji, name: ev.name, desc: ev.desc,
+      sellBonus: ev.sellBonus || 0, growth: ev.growth || 1, fishLuck: ev.fishLuck || 1,
+      giftRiel: ev.giftRiel || 0, items: ev.items || [],
+      active: !!active,
+      claimed: u.gifts[ev.id] === today,
+      startsAt: w ? dayStart(w.start) : null,
+      endsAt: w ? dayEnd(w.end) : null,
+    };
+  }).sort((a, b) => (b.active - a.active) || ((a.startsAt ?? Infinity) - (b.startsAt ?? Infinity)));
+}
+
+/* ------------------------------------------------------------------ */
+/* API                                                                 */
+/* ------------------------------------------------------------------ */
+async function api(req, res, url) {
+  const route = `${req.method} ${url.pathname}`;
+  const now = Date.now();
+
+  if (route === 'GET /api/config') {
+    return send(res, 200, {
+      crops: CROPS, fish: FISH, decor: DECOR, animals: ANIMALS, products: PRODUCTS, shop: SHOP,
+      plotStart: PLOT_START, yardSlots: YARD_SLOTS, penCap: PEN_CAP, look: LOOK_LIMITS, speed: SPEED,
+    });
+  }
+
+  /* ---- auth ---- */
+  if (route === 'POST /api/register' || route === 'POST /api/login') {
+    if (rateLimited('auth:' + clientIp(req), 20, 60000)) return fail(res, 429, 'rate_limited');
+    const b = await readJson(req);
+    const username = String(b.username || '').toLowerCase();
+    const password = String(b.password || '');
+    if (!/^[a-z0-9_]{3,16}$/.test(username)) return fail(res, 400, 'bad_username');
+    if (password.length < 6 || password.length > 72) return fail(res, 400, 'bad_password');
+
+    if (route === 'POST /api/register') {
+      if (db.users[username]) return fail(res, 409, 'username_taken');
+      const name = cleanText(b.name, 16) || username;
+      const lk = b.look || {};
+      const look = {};
+      for (const k of Object.keys(LOOK_LIMITS)) {
+        const v = Number(lk[k]);
+        look[k] = Number.isInteger(v) && v >= 0 && v < LOOK_LIMITS[k] ? v : 0;
+      }
+      const salt = crypto.randomBytes(16);
+      const hash = await scrypt(password, salt);
+      if (db.users[username]) return fail(res, 409, 'username_taken');
+      db.users[username] = newUser(username, name, look, salt, hash);
+    }
+
+    const u = db.users[username];
+    if (!u) return fail(res, 401, 'bad_credentials');
+    if (route === 'POST /api/login') {
+      const hash = await scrypt(password, Buffer.from(u.salt, 'hex'));
+      if (!crypto.timingSafeEqual(hash, Buffer.from(u.hash, 'hex'))) return fail(res, 401, 'bad_credentials');
+    }
+    const token = crypto.randomBytes(24).toString('hex');
+    db.sessions[token] = { username, created: now };
+    u.lastSeen = now;
+    saveSoon();
+    return send(res, 200, { token, me: view(u, now) });
+  }
+
+  /* ---- everything below needs a session ---- */
+  const u = authUser(req);
+  if (!u) return fail(res, 401, 'not_logged_in');
+
+  if (route === 'POST /api/logout') {
+    delete db.sessions[req.headers.authorization.slice(7)];
+    saveSoon();
+    return send(res, 200, { ok: true });
+  }
+
+  if (route === 'GET /api/me') return send(res, 200, view(u, now));
+
+  /* ---- farming ---- */
+  if (route === 'POST /api/plant') {
+    const b = await readJson(req);
+    const crop = CROPS[b.crop];
+    if (!crop) return fail(res, 400, 'bad_crop');
+    if (!isInt(b.plot, 0, u.plots.length - 1)) return fail(res, 400, 'bad_plot');
+    if (u.plots[b.plot]) return fail(res, 409, 'plot_busy');
+    if (levelFor(u.xp) < crop.level) return fail(res, 403, 'level_too_low');
+    if (u.riel < crop.seed) return fail(res, 402, 'not_enough_riel');
+    u.riel -= crop.seed;
+    const dur = Math.round(crop.time * SPEED * bonuses(now).growth);
+    u.plots[b.plot] = { crop: crop.id, plantedAt: now, readyAt: now + dur, watered: false, fert: false };
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  if (route === 'POST /api/water') {
+    const b = await readJson(req);
+    const p = isInt(b.plot, 0, u.plots.length - 1) ? u.plots[b.plot] : null;
+    if (!p) return fail(res, 400, 'bad_plot');
+    if (p.watered) return fail(res, 409, 'already_watered');
+    if (now >= p.readyAt) return fail(res, 409, 'already_ready');
+    p.watered = true;
+    p.readyAt = now + Math.round((p.readyAt - now) * (1 - SHOP.canSave[u.canLevel - 1]));
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  if (route === 'POST /api/fertilize') {
+    const b = await readJson(req);
+    const p = isInt(b.plot, 0, u.plots.length - 1) ? u.plots[b.plot] : null;
+    if (!p) return fail(res, 400, 'bad_plot');
+    if (p.fert) return fail(res, 409, 'already_fertilized');
+    if (now >= p.readyAt) return fail(res, 409, 'already_ready');
+    if (u.fert < 1) return fail(res, 402, 'no_fertilizer');
+    u.fert -= 1;
+    p.fert = true;
+    p.readyAt = now + Math.round((p.readyAt - now) * 0.5);
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  if (route === 'POST /api/harvest') {
+    const b = await readJson(req);
+    const p = isInt(b.plot, 0, u.plots.length - 1) ? u.plots[b.plot] : null;
+    if (!p) return fail(res, 400, 'bad_plot');
+    if (now < p.readyAt) return fail(res, 409, 'not_ready');
+    const crop = CROPS[p.crop];
+    u.inv.crops[crop.id] = (u.inv.crops[crop.id] || 0) + 1;
+    u.xp += crop.xp;
+    u.plots[b.plot] = null;
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  if (route === 'POST /api/sell') {
+    let base = 0;
+    for (const [id, n] of Object.entries(u.inv.crops)) base += (CROPS[id]?.sell || 0) * n;
+    for (const [id, n] of Object.entries(u.inv.fish)) base += (FISH[id]?.sell || 0) * n;
+    for (const [id, n] of Object.entries(u.inv.products)) base += (PRODUCTS[id]?.sell || 0) * n;
+    const bonus = bonuses(now).sell;
+    const total = Math.floor(base * (1 + bonus));
+    u.inv = { crops: {}, fish: {}, products: {} };
+    u.riel += total;
+    saveSoon();
+    return send(res, 200, { ...view(u, now), sold: total, bonus });
+  }
+
+  /* ---- farm shop ---- */
+  if (route === 'POST /api/shop/land') {
+    const step = SHOP.land.find((s) => s.plots > u.plots.length);
+    if (!step) return fail(res, 409, 'max_land');
+    if (levelFor(u.xp) < step.level) return fail(res, 403, 'level_too_low');
+    if (u.riel < step.price) return fail(res, 402, 'not_enough_riel');
+    u.riel -= step.price;
+    while (u.plots.length < step.plots) u.plots.push(null);
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  if (route === 'POST /api/shop/fertilizer') {
+    const b = await readJson(req);
+    const qty = Number(b.qty);
+    if (!isInt(qty, 1, 20)) return fail(res, 400, 'bad_qty');
+    const cost = SHOP.fertPrice * qty;
+    if (u.riel < cost) return fail(res, 402, 'not_enough_riel');
+    u.riel -= cost;
+    u.fert += qty;
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  if (route === 'POST /api/shop/can') {
+    const up = SHOP.canUpgrades[u.canLevel - 1];
+    if (!up) return fail(res, 409, 'max_can');
+    if (levelFor(u.xp) < up.level) return fail(res, 403, 'level_too_low');
+    if (u.riel < up.price) return fail(res, 402, 'not_enough_riel');
+    u.riel -= up.price;
+    u.canLevel += 1;
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  /* ---- decorations ---- */
+  if (route === 'POST /api/decor/buy') {
+    const b = await readJson(req);
+    const d = DECOR[b.id];
+    if (!d) return fail(res, 400, 'bad_item');
+    if (d.event && !eventItemAvailable(d.id, now)) return fail(res, 403, 'event_only');
+    if (levelFor(u.xp) < d.level) return fail(res, 403, 'level_too_low');
+    if (u.riel < d.price) return fail(res, 402, 'not_enough_riel');
+    u.riel -= d.price;
+    u.decor.owned[d.id] = (u.decor.owned[d.id] || 0) + 1;
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  if (route === 'POST /api/decor/place') {
+    const b = await readJson(req);
+    if (!isInt(b.slot, 0, YARD_SLOTS - 1)) return fail(res, 400, 'bad_slot');
+    if (b.id === null || b.id === undefined) {
+      u.decor.placed[b.slot] = null;
+    } else {
+      if (!DECOR[b.id]) return fail(res, 400, 'bad_item');
+      const free = (u.decor.owned[b.id] || 0) - placedCount(u, b.id, b.slot);
+      if (free < 1) return fail(res, 409, 'not_owned');
+      u.decor.placed[b.slot] = b.id;
+    }
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  /* ---- animals ---- */
+  if (route === 'POST /api/animals/buy') {
+    const b = await readJson(req);
+    const a = ANIMALS[b.type];
+    if (!a) return fail(res, 400, 'bad_animal');
+    if (u.animals.length >= PEN_CAP) return fail(res, 409, 'pen_full');
+    if (levelFor(u.xp) < a.level) return fail(res, 403, 'level_too_low');
+    if (u.riel < a.price) return fail(res, 402, 'not_enough_riel');
+    u.riel -= a.price;
+    u.animals.push({ type: a.id, readyAt: null });
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  if (route === 'POST /api/animals/feed') {
+    const b = await readJson(req);
+    const an = isInt(b.index, 0, u.animals.length - 1) ? u.animals[b.index] : null;
+    if (!an) return fail(res, 400, 'bad_animal');
+    if (an.readyAt !== null) return fail(res, 409, 'not_hungry');
+    const def = ANIMALS[an.type];
+    if (u.riel < def.feed) return fail(res, 402, 'not_enough_riel');
+    u.riel -= def.feed;
+    an.readyAt = now + Math.round(def.time * SPEED);
+    saveSoon();
+    return send(res, 200, view(u, now));
+  }
+
+  if (route === 'POST /api/animals/collect') {
+    const b = await readJson(req);
+    const an = isInt(b.index, 0, u.animals.length - 1) ? u.animals[b.index] : null;
+    if (!an) return fail(res, 400, 'bad_animal');
+    if (an.readyAt === null || now < an.readyAt) return fail(res, 409, 'not_ready');
+    const prod = PRODUCTS[ANIMALS[an.type].product];
+    if (prod.fertilizer) u.fert += 1;
+    else u.inv.products[prod.id] = (u.inv.products[prod.id] || 0) + 1;
+    u.xp += 2;
+    an.readyAt = null;
+    saveSoon();
+    return send(res, 200, { ...view(u, now), product: prod.id });
+  }
+
+  /* ---- events ---- */
+  if (route === 'GET /api/events') {
+    return send(res, 200, { events: eventsView(u, now), serverNow: now });
+  }
+
+  if (route === 'POST /api/event/claim') {
+    const b = await readJson(req);
+    const ev = EVENTS.find((e) => e.id === b.event);
+    if (!ev) return fail(res, 404, 'no_such_event');
+    if (!eventStatus(ev, now).active) return fail(res, 409, 'event_not_active');
+    const today = khDate(now);
+    if (u.gifts[ev.id] === today) return fail(res, 409, 'already_claimed');
+    u.gifts[ev.id] = today;
+    u.riel += ev.giftRiel || 0;
+    u.fert += 1;
+    saveSoon();
+    return send(res, 200, { ...view(u, now), gift: { riel: ev.giftRiel || 0, fert: 1 } });
+  }
+
+  /* ---- fishing ---- */
+  if (route === 'POST /api/fish/cast') {
+    const delay = FISH_MIN_DELAY + Math.floor(Math.random() * (FISH_MAX_DELAY - FISH_MIN_DELAY));
+    u.fish = { biteAt: now + delay };
+    return send(res, 200, { delay, window: FISH_WINDOW });
+  }
+
+  if (route === 'POST /api/fish/reel') {
+    const f = u.fish;
+    u.fish = null;
+    if (!f) return fail(res, 409, 'not_fishing');
+    if (now < f.biteAt) return send(res, 200, { result: 'early' });
+    if (now > f.biteAt + FISH_WINDOW + FISH_LATENCY_SLACK) return send(res, 200, { result: 'missed' });
+    const luck = bonuses(now).fishLuck;
+    const weight = (x) => (x.id === 'riel' ? x.weight : x.weight * luck);
+    const total = Object.values(FISH).reduce((a, x) => a + weight(x), 0);
+    let roll = Math.random() * total, caught = FISH.riel;
+    for (const x of Object.values(FISH)) { if ((roll -= weight(x)) < 0) { caught = x; break; } }
+    u.inv.fish[caught.id] = (u.inv.fish[caught.id] || 0) + 1;
+    u.xp += 1;
+    saveSoon();
+    return send(res, 200, { result: 'caught', fish: caught.id, me: view(u, now) });
+  }
+
+  /* ---- friends ---- */
+  if (route === 'GET /api/friends') {
+    const list = u.friends.map((n) => db.users[n]).filter(Boolean).map((f) => ({
+      username: f.username, name: f.name, look: f.look, level: levelFor(f.xp),
+      online: now - f.lastSeen < 30000,
+    }));
+    return send(res, 200, { friends: list });
+  }
+
+  if (route === 'POST /api/friends') {
+    const b = await readJson(req);
+    const name = String(b.username || '').toLowerCase();
+    if (!db.users[name]) return fail(res, 404, 'user_not_found');
+    if (name === u.username) return fail(res, 400, 'cannot_add_self');
+    if (u.friends.includes(name)) return fail(res, 409, 'already_friends');
+    if (u.friends.length >= 100) return fail(res, 400, 'too_many_friends');
+    u.friends.push(name);
+    saveSoon();
+    return send(res, 200, { ok: true });
+  }
+
+  if (route === 'POST /api/friends/remove') {
+    const b = await readJson(req);
+    u.friends = u.friends.filter((n) => n !== String(b.username || '').toLowerCase());
+    saveSoon();
+    return send(res, 200, { ok: true });
+  }
+
+  if (req.method === 'GET' && url.pathname.startsWith('/api/farm/')) {
+    const name = decodeURIComponent(url.pathname.slice('/api/farm/'.length)).toLowerCase();
+    const f = db.users[name];
+    if (!f || !u.friends.includes(name)) return fail(res, 404, 'user_not_found');
+    return send(res, 200, {
+      username: f.username, name: f.name, look: f.look, level: levelFor(f.xp),
+      plots: f.plots.map((p) => (p ? { crop: p.crop, readyAt: p.readyAt } : null)),
+      yard: f.decor.placed,
+      animals: f.animals.map((a) => ({ type: a.type, readyAt: a.readyAt })),
+      serverNow: now,
+    });
+  }
+
+  /* ---- chat (one global room) ---- */
+  if (route === 'GET /api/chat') {
+    const since = Number(url.searchParams.get('since')) || 0;
+    const online = Object.values(db.users).filter((x) => now - x.lastSeen < 30000).length;
+    return send(res, 200, { messages: db.chat.filter((m) => m.id > since), online });
+  }
+
+  if (route === 'POST /api/chat') {
+    const b = await readJson(req);
+    const text = cleanText(b.text, 200);
+    if (!text) return fail(res, 400, 'empty');
+    if (now - u.lastChat < 1000) return fail(res, 429, 'rate_limited');
+    u.lastChat = now;
+    db.chat.push({ id: ++db.chatSeq, user: u.username, name: u.name, text, t: now });
+    if (db.chat.length > 100) db.chat.splice(0, db.chat.length - 100);
+    saveSoon();
+    return send(res, 200, { ok: true });
+  }
+
+  return fail(res, 404, 'not_found');
+}
+
+/* ------------------------------------------------------------------ */
+/* Static files                                                        */
+/* ------------------------------------------------------------------ */
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon',
+  '.webmanifest': 'application/manifest+json',
+};
+
+function serveStatic(req, res, url) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return fail(res, 405, 'method_not_allowed');
+  let rel;
+  try { rel = decodeURIComponent(url.pathname); } catch { return fail(res, 400, 'bad_path'); }
+  if (rel.includes('\0')) return fail(res, 400, 'bad_path');
+  if (rel === '/') rel = '/index.html';
+  const file = path.normalize(path.join(PUBLIC_DIR, rel));
+  if (file !== PUBLIC_DIR && !file.startsWith(PUBLIC_DIR + path.sep)) return fail(res, 403, 'forbidden');
+  fs.readFile(file, (err, data) => {
+    if (err) return fail(res, 404, 'not_found');
+    const ext = path.extname(file).toLowerCase();
+    res.writeHead(200, {
+      'Content-Type': MIME[ext] || 'application/octet-stream',
+      'Cache-Control': ext === '.html' || file.endsWith('sw.js') ? 'no-cache' : 'public, max-age=3600',
+      ...SECURITY_HEADERS,
+    });
+    res.end(req.method === 'HEAD' ? undefined : data);
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Server                                                              */
+/* ------------------------------------------------------------------ */
+loadDb();
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname.startsWith('/api/')) {
+      if (rateLimited('api:' + clientIp(req), 300, 60000)) return fail(res, 429, 'rate_limited');
+      return await api(req, res, url);
+    }
+    serveStatic(req, res, url);
+  } catch (e) {
+    if (res.headersSent) return;
+    if (e.status) return fail(res, e.status, e.message);
+    console.error(e);
+    fail(res, 500, 'server_error');
+  }
+});
+
+server.listen(PORT, () => {
+  const on = activeEvents(Date.now()).map((e) => e.id);
+  console.log(`Srok Srae running on http://localhost:${PORT}  (growth x${(1 / SPEED).toFixed(1)}, active events: ${on.join(', ') || 'none'})`);
+});
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => { saveNow(); process.exit(0); });
+}

@@ -1,0 +1,46 @@
+{
+  "_help": "Edit freely. 'windows' are [start, end] dates in Cambodia time (inclusive). 'yearly' repeats every year (MM-DD). Lunar festivals move each year, so add new windows when the government announces them. Effects: sellBonus (0.2 = +20% sell price), growth (0.8 = crops grow 20% faster), fishLuck (2 = rare fish twice as likely), giftRiel (daily gift). 'items' are decoration ids that can only be bought while the event is on.",
+  "events": [
+    {
+      "id": "khmer_new_year",
+      "emoji": "🎊",
+      "name": { "km": "បុណ្យចូលឆ្នាំខ្មែរ", "en": "Khmer New Year" },
+      "desc": { "km": "រីករាយឆ្នាំថ្មី! លក់បានថ្លៃជាងធម្មតា ហើយទទួលកាដូរាល់ថ្ងៃ។", "en": "Happy New Year! Better sell prices and a daily gift." },
+      "yearly": ["04-14", "04-16"],
+      "sellBonus": 0.2,
+      "giftRiel": 40,
+      "items": ["sand_mound"]
+    },
+    {
+      "id": "royal_ploughing",
+      "emoji": "🐂",
+      "name": { "km": "ព្រះរាជពិធីច្រត់ព្រះនង្គ័ល", "en": "Royal Ploughing Ceremony" },
+      "desc": { "km": "ដំណាំដុះលឿនជាងមុន នៅពេលចាប់ផ្ដើមរដូវកសិកម្ម។", "en": "Crops grow faster as the planting season opens." },
+      "windows": [["2026-05-05", "2026-05-05"], ["2027-05-24", "2027-05-24"]],
+      "growth": 0.75,
+      "giftRiel": 25,
+      "items": ["plough_ox"]
+    },
+    {
+      "id": "pchum_ben",
+      "emoji": "🕯️",
+      "name": { "km": "ភ្ជុំបិណ្ឌ", "en": "Pchum Ben" },
+      "desc": { "km": "រំលឹកដល់បុព្វបុរស។ ទទួលកាដូរាល់ថ្ងៃ និងតម្លៃលក់ល្អជាងមុន។", "en": "Remembering the ancestors. A daily gift and slightly better prices." },
+      "windows": [["2026-10-10", "2026-10-12"], ["2027-09-29", "2027-10-01"]],
+      "sellBonus": 0.1,
+      "giftRiel": 30,
+      "items": ["candle"]
+    },
+    {
+      "id": "water_festival",
+      "emoji": "🛶",
+      "name": { "km": "បុណ្យអុំទូក", "en": "Water Festival" },
+      "desc": { "km": "ត្រីកម្រចាប់បានងាយជាងមុន ហើយលក់បានថ្លៃជាង។", "en": "Rare fish bite more often and everything sells for more." },
+      "windows": [["2026-11-23", "2026-11-25"], ["2027-11-12", "2027-11-14"]],
+      "sellBonus": 0.2,
+      "fishLuck": 2.5,
+      "giftRiel": 40,
+      "items": ["racing_boat", "moon"]
+    }
+  ]
+}
