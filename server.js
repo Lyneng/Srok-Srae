@@ -394,15 +394,15 @@ function ensureUser(u) {
   u.hash = String(u.hash || "");
   u.riel =
     typeof u.riel === "number" && Number.isFinite(u.riel) && u.riel >= 0
-      ? Math.floor(u.riel)
+      ? Math.min(100000000, Math.floor(u.riel))
       : START_RIEL;
   u.xp =
     typeof u.xp === "number" && Number.isFinite(u.xp) && u.xp >= 0
-      ? Math.floor(u.xp)
+      ? Math.min(10000000, Math.floor(u.xp))
       : 0;
   u.fert =
     typeof u.fert === "number" && Number.isFinite(u.fert) && u.fert >= 0
-      ? Math.floor(u.fert)
+      ? Math.min(999, Math.floor(u.fert))
       : 0;
   u.canLevel =
     typeof u.canLevel === "number" && u.canLevel >= 1 && u.canLevel <= 3
@@ -411,6 +411,7 @@ function ensureUser(u) {
 
   if (!Array.isArray(u.plots)) u.plots = [];
   while (u.plots.length < PLOT_START) u.plots.push(null);
+  if (u.plots.length > 24) u.plots = u.plots.slice(0, 24);
   u.plots = u.plots.map((p) => {
     if (!p || typeof p !== "object" || !CROPS[p.crop]) return null;
     return {
@@ -433,7 +434,7 @@ function ensureUser(u) {
       if (typeof count !== "number" || count <= 0 || !Number.isFinite(count)) {
         delete u.inv[cat][id];
       } else {
-        u.inv[cat][id] = Math.floor(count);
+        u.inv[cat][id] = Math.min(9999, Math.floor(count));
       }
     }
   }
@@ -451,7 +452,7 @@ function ensureUser(u) {
     ) {
       delete u.decor.owned[id];
     } else {
-      u.decor.owned[id] = Math.floor(count);
+      u.decor.owned[id] = Math.min(999, Math.floor(count));
     }
   }
   if (!Array.isArray(u.decor.placed)) u.decor.placed = [];
@@ -472,9 +473,13 @@ function ensureUser(u) {
   if (!u.gifts || typeof u.gifts !== "object" || Array.isArray(u.gifts))
     u.gifts = {};
   if (!Array.isArray(u.friends)) u.friends = [];
-  u.friends = u.friends.filter(
-    (f) => typeof f === "string" && /^[a-z0-9_]{3,16}$/.test(f),
-  );
+  u.friends = Array.from(
+    new Set(
+      u.friends.filter(
+        (f) => typeof f === "string" && /^[a-z0-9_]{3,16}$/.test(f),
+      ),
+    ),
+  ).slice(0, 100);
 
   if (
     u.fish &&
@@ -764,6 +769,8 @@ function view(u, now = Date.now()) {
     canLevel: u.canLevel,
     decor: u.decor,
     animals: u.animals,
+    friends: u.friends || [],
+    gifts: u.gifts || {},
     serverNow: now,
   };
 }
@@ -944,10 +951,14 @@ async function api(req, res, url) {
             // Merge newer state if client was active on another serverless worker
             u.riel = Math.max(u.riel, Number(bk.riel) || 0);
             u.xp = Math.max(u.xp, Number(bk.xp) || 0);
+            u.fert = Math.max(u.fert, Number(bk.fert) || 0);
+            if (bk.canLevel && bk.canLevel > u.canLevel) u.canLevel = bk.canLevel;
             if (Array.isArray(bk.plots)) u.plots = bk.plots;
             if (bk.inv && typeof bk.inv === "object") u.inv = bk.inv;
             if (bk.decor && typeof bk.decor === "object") u.decor = bk.decor;
             if (Array.isArray(bk.animals)) u.animals = bk.animals;
+            if (Array.isArray(bk.friends)) u.friends = bk.friends;
+            if (bk.gifts && typeof bk.gifts === "object") u.gifts = bk.gifts;
             ensureUser(u);
             saveNow();
           }
@@ -1303,7 +1314,7 @@ async function api(req, res, url) {
     if (u.friends.length >= 100) return fail(res, 400, "too_many_friends");
     u.friends.push(name);
     saveNow();
-    return send(res, 200, { ok: true });
+    return send(res, 200, { ok: true, me: view(u, now) });
   }
 
   if (route === "POST /api/friends/remove") {
@@ -1312,7 +1323,7 @@ async function api(req, res, url) {
     const name = raw.toLowerCase().trim();
     u.friends = u.friends.filter((n) => n !== name);
     saveNow();
-    return send(res, 200, { ok: true });
+    return send(res, 200, { ok: true, me: view(u, now) });
   }
 
   if (req.method === "GET" && url.pathname.startsWith("/api/farm/")) {

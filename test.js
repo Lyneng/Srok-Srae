@@ -365,6 +365,21 @@ async function call(method, url, body, token) {
   r = await call('GET', '/api/me', undefined, r.data.token);
   check('restored user can call authenticated endpoints', r.status === 200 && r.data.riel === 555);
 
+  // Test data bounds & security validation on restore
+  const forgedBackup = {
+    username: 'dara',
+    salt: saved.users.dara.salt,
+    hash: saved.users.dara.hash,
+    riel: 999999999999,
+    plots: new Array(50).fill(null),
+    friends: ['sokha', 'sokha', 'dara_friend'],
+  };
+  delete db.users.dara;
+  r = await call('POST', '/api/login', { username: 'dara', password: 'secret1', backup: forgedBackup });
+  check('restore caps over-limit plots to 24', r.status === 200 && r.data.me.plots.length === 24);
+  check('restore caps over-limit riel', r.data.me.riel === 100000000);
+  check('restore deduplicates friends', r.data.me.friends.length === 2);
+
   console.log(`\nAll ${passed} checks passed successfully.`);
   process.exit(0);
 })().catch((e) => {

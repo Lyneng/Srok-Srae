@@ -1190,7 +1190,12 @@
     if (el.id === 'backBtn') { S.visit = null; return renderFriends(); }
     if (d.visit) return visitFriend(d.visit);
     if (d.unfriend) {
-      api('/api/friends/remove', { username: d.unfriend }).then(loadFriends).catch((ex) => toast(errText(ex)));
+      api('/api/friends/remove', { username: d.unfriend })
+        .then((r) => {
+          if (r && r.me) setMe(r.me);
+          loadFriends();
+        })
+        .catch((ex) => toast(errText(ex)));
     }
   });
 
@@ -1215,7 +1220,8 @@
       const name = input.value.trim();
       if (!name) return;
       try {
-        await api('/api/friends', { username: name });
+        const r = await api('/api/friends', { username: name });
+        if (r && r.me) setMe(r.me);
         input.value = '';
         loadFriends();
       } catch (ex) { toast(errText(ex)); }
@@ -1269,6 +1275,19 @@
     if (lastUser) S.form.username = lastUser;
     renderAuth();
   }
+
+  window.addEventListener('storage', (e) => {
+    if (S.me && e.key === 'srok_vault_' + S.me.username.toLowerCase()) {
+      try {
+        const updated = JSON.parse(e.newValue);
+        if (updated && updated.username === S.me.username) {
+          S.me = { ...S.me, ...updated };
+          renderHeader();
+          if (S.tab === 'farm') updateFarm();
+        }
+      } catch {}
+    }
+  });
 
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   boot();
