@@ -60,10 +60,18 @@ Existing player accounts are upgraded automatically when you update the game.
 
 ## Put it online
 
-1. Rent a small VPS (Singapore region is closest to Cambodia).
+### Option A: Small VPS or Platform with Persistent Disk (Recommended for Long-term Storage)
+Because the game uses a local JSON file (`data/db.json`) for data storage, hosting on a host with persistent storage ensures player data remains intact across server restarts:
+1. Rent a small VPS (Singapore region is closest to Cambodia) or use Railway / Render with a persistent volume.
 2. Install Node 18+, copy this folder, run `PORT=3000 TRUST_PROXY=1 node server.js` under `pm2` or systemd so it restarts.
 3. Put **Caddy** or **nginx** in front for free HTTPS (needed for "Add to Home Screen"), and point your domain at it.
 4. Back up `data/db.json` regularly.
+
+### Option B: Hosting on Vercel
+The project now includes `vercel.json` and `api/index.js` so it runs directly on Vercel:
+- **Routing**: Static assets (`public/`) are served by Vercel CDN at the root, and `/api/*` routes are handled by `@vercel/node` serverless functions.
+- **Serverless File Storage**: Vercel functions have a read-only root filesystem. The server automatically routes `DATA_FILE` to `/tmp/srok-srae-data/db.json` and flushes changes synchronously before serverless function execution freezes.
+- **Important Note on Vercel Persistence**: Vercel serverless containers are ephemeral (`/tmp` is reset when containers spin down or redeploy). For production with real persistent multi-player data, consider using a VPS/Railway or connecting an external database.
 
 ## Things to know
 

@@ -15,9 +15,20 @@ const crypto = require('crypto');
 
 const PORT = Number(process.env.PORT || 3000);
 const SPEED = Number(process.env.GROWTH_SPEED || 1);
-const TRUST_PROXY = process.env.TRUST_PROXY === '1';
+const TRUST_PROXY = process.env.TRUST_PROXY === '1' || Boolean(process.env.VERCEL);
 const FORCE_EVENTS = (process.env.FORCE_EVENT || '').split(',').map((s) => s.trim()).filter(Boolean);
-const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'db.json');
+
+const isServerless = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+function resolveDataFilePath() {
+  if (process.env.DATA_FILE) return process.env.DATA_FILE;
+  if (isServerless) {
+    return path.join('/tmp', 'srok-srae-data', 'db.json');
+  }
+  return path.join(__dirname, 'data', 'db.json');
+}
+
+let DATA_FILE = resolveDataFilePath();
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const EVENTS_FILE = path.join(__dirname, 'events.json');
 
@@ -82,6 +93,7 @@ const PRODUCTS = {
   milk:     { id: 'milk',     emoji: '🥛', sell: 60, name: { km: 'ទឹកដោះក្របី', en: 'Buffalo milk' } },
   manure:   { id: 'manure',   emoji: '🌿', sell: 0,  fertilizer: true, name: { km: 'ជី', en: 'Fertilizer' } },
 };
+
 const ANIMALS = {
   chicken: { id: 'chicken', emoji: '🐔', price: 40,  level: 2, feed: 2,  time: 60000,  product: 'egg',      name: { km: 'មាន់', en: 'Chicken' } },
   duck:    { id: 'duck',    emoji: '🦆', price: 70,  level: 2, feed: 3,  time: 90000,  product: 'duck_egg', name: { km: 'ទា', en: 'Duck' } },
@@ -95,7 +107,7 @@ const FISH_WINDOW = 1500;
 const FISH_LATENCY_SLACK = 400;
 
 const LOOK_LIMITS = { skin: 5, hair: 6, outfit: 6 };
-const levelFor = (xp) => Math.floor(Math.sqrt(xp / 25)) + 1;
+const levelFor = (xp) => Math.floor(Math.sqrt((typeof xp === 'number' && xp > 0 ? xp : 0) / 25)) + 1;
 
 /* ------------------------------------------------------------------ */
 /* Events (loaded from events.json)                                    */
@@ -148,52 +160,196 @@ function eventItemAvailable(id, now) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Tiny JSON "database" with debounced atomic saves                    */
+/* Tiny JSON "database" with validation and atomic saves               */
 /* ------------------------------------------------------------------ */
 let db = { users: {}, sessions: {}, chatSeq: 0, chat: [] };
+let dbMtime = 0;
 
 function ensureUser(u) {
-  u.plots ||= [];
+  if (!u || typeof u !== 'object') return null;
+  u.username = String(u.username || '').toLowerCase();
+  u.name = cleanText(u.name, 16) || u.username;
+
+  if (!u.look || typeof u.look !== 'object' || Array.isArray(u.look)) {
+    u.look = { skin: 0, hair: 0, outfit: 0 };
+  }
+  for (const k of Object.keys(LOOK_LIMITS)) {
+    const v = Number(u.look[k]);
+    u.look[k] = Number.isInteger(v) && v >= 0 && v < LOOK_LIMITS[k] ? v : 0;
+  }
+
+  u.salt = String(u.salt || '');
+  u.hash = String(u.hash || '');
+  u.riel = typeof u.riel === 'number' && Number.isFinite(u.riel) && u.riel >= 0 ? Math.floor(u.riel) : START_RIEL;
+  u.xp = typeof u.xp === 'number' && Number.isFinite(u.xp) && u.xp >= 0 ? Math.floor(u.xp) : 0;
+  u.fert = typeof u.fert === 'number' && Number.isFinite(u.fert) && u.fert >= 0 ? Math.floor(u.fert) : 0;
+  u.canLevel = typeof u.canLevel === 'number' && u.canLevel >= 1 && u.canLevel <= 3 ? Math.floor(u.canLevel) : 1;
+
+  if (!Array.isArray(u.plots)) u.plots = [];
   while (u.plots.length < PLOT_START) u.plots.push(null);
-  u.fert ||= 0;
-  u.canLevel ||= 1;
-  u.inv ||= {};
-  u.inv.crops ||= {}; u.inv.fish ||= {}; u.inv.products ||= {};
-  u.decor ||= { owned: {}, placed: [] };
-  u.decor.owned ||= {};
-  u.decor.placed ||= [];
+  u.plots = u.plots.map((p) => {
+    if (!p || typeof p !== 'object' || !CROPS[p.crop]) return null;
+    return {
+      crop: p.crop,
+      plantedAt: Number(p.plantedAt) || Date.now(),
+      readyAt: Number(p.readyAt) || Date.now(),
+      watered: Boolean(p.watered),
+      fert: Boolean(p.fert),
+    };
+  });
+
+  if (!u.inv || typeof u.inv !== 'object' || Array.isArray(u.inv)) u.inv = {};
+  if (!u.inv.crops || typeof u.inv.crops !== 'object') u.inv.crops = {};
+  if (!u.inv.fish || typeof u.inv.fish !== 'object') u.inv.fish = {};
+  if (!u.inv.products || typeof u.inv.products !== 'object') u.inv.products = {};
+
+  for (const cat of ['crops', 'fish', 'products']) {
+    for (const [id, count] of Object.entries(u.inv[cat])) {
+      if (typeof count !== 'number' || count <= 0 || !Number.isFinite(count)) {
+        delete u.inv[cat][id];
+      } else {
+        u.inv[cat][id] = Math.floor(count);
+      }
+    }
+  }
+
+  if (!u.decor || typeof u.decor !== 'object' || Array.isArray(u.decor)) {
+    u.decor = { owned: {}, placed: [] };
+  }
+  if (!u.decor.owned || typeof u.decor.owned !== 'object') u.decor.owned = {};
+  for (const [id, count] of Object.entries(u.decor.owned)) {
+    if (typeof count !== 'number' || count <= 0 || !Number.isFinite(count) || !DECOR[id]) {
+      delete u.decor.owned[id];
+    } else {
+      u.decor.owned[id] = Math.floor(count);
+    }
+  }
+  if (!Array.isArray(u.decor.placed)) u.decor.placed = [];
   while (u.decor.placed.length < YARD_SLOTS) u.decor.placed.push(null);
-  u.animals ||= [];
-  u.gifts ||= {};
-  u.friends ||= [];
+  u.decor.placed = u.decor.placed.slice(0, YARD_SLOTS).map((d) => (d && DECOR[d] ? d : null));
+
+  if (!Array.isArray(u.animals)) u.animals = [];
+  u.animals = u.animals
+    .filter((a) => a && typeof a === 'object' && ANIMALS[a.type])
+    .slice(0, PEN_CAP)
+    .map((a) => ({
+      type: a.type,
+      readyAt: a.readyAt === null ? null : (Number(a.readyAt) || null),
+    }));
+
+  if (!u.gifts || typeof u.gifts !== 'object' || Array.isArray(u.gifts)) u.gifts = {};
+  if (!Array.isArray(u.friends)) u.friends = [];
+  u.friends = u.friends.filter((f) => typeof f === 'string' && /^[a-z0-9_]{3,16}$/.test(f));
+
+  if (u.fish && (typeof u.fish !== 'object' || typeof u.fish.biteAt !== 'number')) {
+    u.fish = null;
+  }
+
+  u.lastSeen = Number(u.lastSeen) || Date.now();
+  u.lastChat = Number(u.lastChat) || 0;
+  u.created = Number(u.created) || Date.now();
+
   return u;
+}
+
+function pruneOldSessions() {
+  const cutoff = Date.now() - (30 * 24 * 3600 * 1000); // 30 days
+  for (const [token, s] of Object.entries(db.sessions)) {
+    if (!s || !s.created || s.created < cutoff) {
+      delete db.sessions[token];
+    }
+  }
 }
 
 function loadDb() {
   try {
-    db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    db.users ||= {}; db.sessions ||= {}; db.chat ||= []; db.chatSeq ||= 0;
-    Object.values(db.users).forEach(ensureUser);
+    if (fs.existsSync(DATA_FILE)) {
+      const content = fs.readFileSync(DATA_FILE, 'utf8');
+      if (content.trim()) {
+        const parsed = JSON.parse(content);
+        if (parsed && typeof parsed === 'object') {
+          db.users = (parsed.users && typeof parsed.users === 'object') ? parsed.users : {};
+          db.sessions = (parsed.sessions && typeof parsed.sessions === 'object') ? parsed.sessions : {};
+          db.chat = Array.isArray(parsed.chat) ? parsed.chat : [];
+          db.chatSeq = Number.isInteger(parsed.chatSeq) ? parsed.chatSeq : 0;
+          Object.values(db.users).forEach(ensureUser);
+          pruneOldSessions();
+        }
+      }
+      try { dbMtime = fs.statSync(DATA_FILE).mtimeMs; } catch { dbMtime = Date.now(); }
+    } else {
+      // Seed file from data/db.json if running in /tmp (Vercel) and not yet initialized
+      const seedFile = path.join(__dirname, 'data', 'db.json');
+      if (DATA_FILE !== seedFile && fs.existsSync(seedFile)) {
+        try {
+          const content = fs.readFileSync(seedFile, 'utf8');
+          if (content.trim()) {
+            const parsed = JSON.parse(content);
+            if (parsed && typeof parsed === 'object') {
+              db.users = parsed.users || {};
+              db.sessions = parsed.sessions || {};
+              db.chat = Array.isArray(parsed.chat) ? parsed.chat : [];
+              db.chatSeq = parsed.chatSeq || 0;
+              Object.values(db.users).forEach(ensureUser);
+            }
+          }
+        } catch { /* ignore corrupt seed */ }
+      }
+      saveNow();
+    }
   } catch (e) {
-    if (e.code !== 'ENOENT') console.error('Could not read database, starting empty:', e.message);
+    console.error('Could not read database, starting safely:', e.message);
+    if (fs.existsSync(DATA_FILE)) {
+      try {
+        const backup = DATA_FILE + '.corrupt.' + Date.now();
+        fs.copyFileSync(DATA_FILE, backup);
+        console.warn(`Corrupted database backed up to ${backup}`);
+      } catch {}
+    }
   }
+}
+
+function maybeReloadDb() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const stat = fs.statSync(DATA_FILE);
+      if (stat.mtimeMs > dbMtime) {
+        loadDb();
+      }
+    }
+  } catch {}
 }
 
 let saveTimer = null;
 function saveSoon() {
+  if (isServerless) {
+    saveNow();
+    return;
+  }
   if (saveTimer) return;
-  saveTimer = setTimeout(saveNow, 500);
+  saveTimer = setTimeout(saveNow, 250);
 }
+
 function saveNow() {
   clearTimeout(saveTimer);
   saveTimer = null;
   try {
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+    const dir = path.dirname(DATA_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
     const tmp = DATA_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(db));
+    fs.writeFileSync(tmp, JSON.stringify(db, null, 2), 'utf8');
     fs.renameSync(tmp, DATA_FILE);
+    try { dbMtime = fs.statSync(DATA_FILE).mtimeMs; } catch { dbMtime = Date.now(); }
   } catch (e) {
     console.error('Save failed:', e.message);
+    if ((e.code === 'EROFS' || e.code === 'EACCES') && !DATA_FILE.startsWith('/tmp')) {
+      const fallback = path.join('/tmp', 'srok-srae-data', 'db.json');
+      console.warn(`Filesystem read-only. Switching DATA_FILE to ${fallback}`);
+      DATA_FILE = fallback;
+      saveNow();
+    }
   }
 }
 
@@ -210,6 +366,10 @@ const SECURITY_HEADERS = {
 };
 
 function send(res, code, obj) {
+  if (isServerless) {
+    // Flush any pending write immediately before serverless response freeze
+    saveNow();
+  }
   res.writeHead(code, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
@@ -220,18 +380,48 @@ function send(res, code, obj) {
 const fail = (res, code, error) => send(res, code, { error });
 
 function readJson(req) {
+  if (req.body !== undefined && req.body !== null) {
+    if (typeof req.body === 'object' && !Array.isArray(req.body)) {
+      return Promise.resolve(req.body);
+    }
+    if (typeof req.body === 'string') {
+      try {
+        const parsed = JSON.parse(req.body);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          return Promise.resolve(parsed);
+        }
+        return Promise.reject(Object.assign(new Error('bad_json'), { status: 400 }));
+      } catch {
+        return Promise.reject(Object.assign(new Error('bad_json'), { status: 400 }));
+      }
+    }
+  }
+
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > 10 * 1024) { reject(Object.assign(new Error('too_large'), { status: 413 })); req.destroy(); return; }
+      if (size > 10 * 1024) {
+        reject(Object.assign(new Error('too_large'), { status: 413 }));
+        req.destroy();
+        return;
+      }
       chunks.push(c);
     });
     req.on('end', () => {
       if (!chunks.length) return resolve({});
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
-      catch { reject(Object.assign(new Error('bad_json'), { status: 400 })); }
+      try {
+        const raw = Buffer.concat(chunks).toString('utf8').trim();
+        if (!raw) return resolve({});
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return reject(Object.assign(new Error('bad_json'), { status: 400 }));
+        }
+        resolve(parsed);
+      } catch {
+        reject(Object.assign(new Error('bad_json'), { status: 400 }));
+      }
     });
     req.on('error', reject);
   });
@@ -241,8 +431,10 @@ function clientIp(req) {
   if (TRUST_PROXY) {
     const xf = req.headers['x-forwarded-for'];
     if (xf) return String(xf).split(',')[0].trim();
+    const realIp = req.headers['x-real-ip'];
+    if (realIp) return String(realIp).trim();
   }
-  return req.socket.remoteAddress || 'unknown';
+  return req.socket?.remoteAddress || 'unknown';
 }
 
 const hits = new Map();
@@ -261,7 +453,8 @@ function scrypt(password, salt) {
 }
 
 function cleanText(s, max) {
-  return String(s ?? '').replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
+  if (typeof s !== 'string') return '';
+  return s.replace(/[\u0000-\u001f\u007f]/g, '').replace(/\s+/g, ' ').trim().slice(0, max);
 }
 
 function newUser(username, name, look, salt, hash) {
@@ -287,9 +480,10 @@ function view(u, now = Date.now()) {
 
 function authUser(req) {
   const h = req.headers.authorization || '';
-  const token = h.startsWith('Bearer ') ? h.slice(7) : '';
-  const s = token && db.sessions[token];
-  if (!s) return null;
+  const token = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+  if (!token || typeof token !== 'string') return null;
+  const s = db.sessions[token];
+  if (!s || typeof s !== 'object' || !s.username) return null;
   const u = db.users[s.username];
   if (!u) return null;
   u.lastSeen = Date.now();
@@ -299,11 +493,13 @@ function authUser(req) {
 const isInt = (n, min, max) => Number.isInteger(n) && n >= min && n <= max;
 
 function placedCount(u, id, exceptSlot = -1) {
+  if (!u.decor || !Array.isArray(u.decor.placed)) return 0;
   return u.decor.placed.reduce((n, x, i) => n + (x === id && i !== exceptSlot ? 1 : 0), 0);
 }
 
 function eventsView(u, now) {
   const today = khDate(now);
+  const gifts = (u && u.gifts && typeof u.gifts === 'object') ? u.gifts : {};
   return EVENTS.map((ev) => {
     const { active, next } = eventStatus(ev, now);
     const w = active || next;
@@ -312,7 +508,7 @@ function eventsView(u, now) {
       sellBonus: ev.sellBonus || 0, growth: ev.growth || 1, fishLuck: ev.fishLuck || 1,
       giftRiel: ev.giftRiel || 0, items: ev.items || [],
       active: !!active,
-      claimed: u.gifts[ev.id] === today,
+      claimed: gifts[ev.id] === today,
       startsAt: w ? dayStart(w.start) : null,
       endsAt: w ? dayEnd(w.end) : null,
     };
@@ -337,15 +533,17 @@ async function api(req, res, url) {
   if (route === 'POST /api/register' || route === 'POST /api/login') {
     if (rateLimited('auth:' + clientIp(req), 20, 60000)) return fail(res, 429, 'rate_limited');
     const b = await readJson(req);
-    const username = String(b.username || '').toLowerCase();
-    const password = String(b.password || '');
+    const rawUsername = typeof b.username === 'string' ? b.username : '';
+    const username = rawUsername.toLowerCase().trim();
+    const password = typeof b.password === 'string' ? b.password : '';
+
     if (!/^[a-z0-9_]{3,16}$/.test(username)) return fail(res, 400, 'bad_username');
     if (password.length < 6 || password.length > 72) return fail(res, 400, 'bad_password');
 
     if (route === 'POST /api/register') {
       if (db.users[username]) return fail(res, 409, 'username_taken');
-      const name = cleanText(b.name, 16) || username;
-      const lk = b.look || {};
+      const name = (typeof b.name === 'string' ? cleanText(b.name, 16) : '') || username;
+      const lk = (b.look && typeof b.look === 'object' && !Array.isArray(b.look)) ? b.look : {};
       const look = {};
       for (const k of Object.keys(LOOK_LIMITS)) {
         const v = Number(lk[k]);
@@ -360,13 +558,17 @@ async function api(req, res, url) {
     const u = db.users[username];
     if (!u) return fail(res, 401, 'bad_credentials');
     if (route === 'POST /api/login') {
-      const hash = await scrypt(password, Buffer.from(u.salt, 'hex'));
-      if (!crypto.timingSafeEqual(hash, Buffer.from(u.hash, 'hex'))) return fail(res, 401, 'bad_credentials');
+      const uSalt = Buffer.from(u.salt, 'hex');
+      const uHash = Buffer.from(u.hash, 'hex');
+      const hash = await scrypt(password, uSalt);
+      if (hash.length !== uHash.length || !crypto.timingSafeEqual(hash, uHash)) {
+        return fail(res, 401, 'bad_credentials');
+      }
     }
     const token = crypto.randomBytes(24).toString('hex');
     db.sessions[token] = { username, created: now };
     u.lastSeen = now;
-    saveSoon();
+    saveNow();
     return send(res, 200, { token, me: view(u, now) });
   }
 
@@ -375,8 +577,12 @@ async function api(req, res, url) {
   if (!u) return fail(res, 401, 'not_logged_in');
 
   if (route === 'POST /api/logout') {
-    delete db.sessions[req.headers.authorization.slice(7)];
-    saveSoon();
+    const h = req.headers.authorization || '';
+    const token = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+    if (token && db.sessions[token]) {
+      delete db.sessions[token];
+      saveNow();
+    }
     return send(res, 200, { ok: true });
   }
 
@@ -385,6 +591,7 @@ async function api(req, res, url) {
   /* ---- farming ---- */
   if (route === 'POST /api/plant') {
     const b = await readJson(req);
+    if (typeof b.crop !== 'string') return fail(res, 400, 'bad_crop');
     const crop = CROPS[b.crop];
     if (!crop) return fail(res, 400, 'bad_crop');
     if (!isInt(b.plot, 0, u.plots.length - 1)) return fail(res, 400, 'bad_plot');
@@ -392,61 +599,78 @@ async function api(req, res, url) {
     if (levelFor(u.xp) < crop.level) return fail(res, 403, 'level_too_low');
     if (u.riel < crop.seed) return fail(res, 402, 'not_enough_riel');
     u.riel -= crop.seed;
-    const dur = Math.round(crop.time * SPEED * bonuses(now).growth);
+    const dur = Math.round(crop.time * SPEED * (bonuses(now).growth || 1));
     u.plots[b.plot] = { crop: crop.id, plantedAt: now, readyAt: now + dur, watered: false, fert: false };
-    saveSoon();
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
   if (route === 'POST /api/water') {
     const b = await readJson(req);
-    const p = isInt(b.plot, 0, u.plots.length - 1) ? u.plots[b.plot] : null;
+    if (!isInt(b.plot, 0, u.plots.length - 1)) return fail(res, 400, 'bad_plot');
+    const p = u.plots[b.plot];
     if (!p) return fail(res, 400, 'bad_plot');
     if (p.watered) return fail(res, 409, 'already_watered');
     if (now >= p.readyAt) return fail(res, 409, 'already_ready');
     p.watered = true;
-    p.readyAt = now + Math.round((p.readyAt - now) * (1 - SHOP.canSave[u.canLevel - 1]));
-    saveSoon();
+    const saveRate = SHOP.canSave[(u.canLevel || 1) - 1] ?? SHOP.canSave[0];
+    const remaining = Math.max(0, p.readyAt - now);
+    p.readyAt = now + Math.round(remaining * (1 - saveRate));
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
   if (route === 'POST /api/fertilize') {
     const b = await readJson(req);
-    const p = isInt(b.plot, 0, u.plots.length - 1) ? u.plots[b.plot] : null;
+    if (!isInt(b.plot, 0, u.plots.length - 1)) return fail(res, 400, 'bad_plot');
+    const p = u.plots[b.plot];
     if (!p) return fail(res, 400, 'bad_plot');
     if (p.fert) return fail(res, 409, 'already_fertilized');
     if (now >= p.readyAt) return fail(res, 409, 'already_ready');
     if (u.fert < 1) return fail(res, 402, 'no_fertilizer');
     u.fert -= 1;
     p.fert = true;
-    p.readyAt = now + Math.round((p.readyAt - now) * 0.5);
-    saveSoon();
+    const remaining = Math.max(0, p.readyAt - now);
+    p.readyAt = now + Math.round(remaining * 0.5);
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
   if (route === 'POST /api/harvest') {
     const b = await readJson(req);
-    const p = isInt(b.plot, 0, u.plots.length - 1) ? u.plots[b.plot] : null;
+    if (!isInt(b.plot, 0, u.plots.length - 1)) return fail(res, 400, 'bad_plot');
+    const p = u.plots[b.plot];
     if (!p) return fail(res, 400, 'bad_plot');
     if (now < p.readyAt) return fail(res, 409, 'not_ready');
     const crop = CROPS[p.crop];
+    if (!crop) {
+      u.plots[b.plot] = null;
+      saveNow();
+      return fail(res, 400, 'bad_crop');
+    }
     u.inv.crops[crop.id] = (u.inv.crops[crop.id] || 0) + 1;
-    u.xp += crop.xp;
+    u.xp += crop.xp || 0;
     u.plots[b.plot] = null;
-    saveSoon();
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
   if (route === 'POST /api/sell') {
     let base = 0;
-    for (const [id, n] of Object.entries(u.inv.crops)) base += (CROPS[id]?.sell || 0) * n;
-    for (const [id, n] of Object.entries(u.inv.fish)) base += (FISH[id]?.sell || 0) * n;
-    for (const [id, n] of Object.entries(u.inv.products)) base += (PRODUCTS[id]?.sell || 0) * n;
-    const bonus = bonuses(now).sell;
+    for (const [id, n] of Object.entries(u.inv.crops || {})) {
+      if (typeof n === 'number' && n > 0 && CROPS[id]) base += CROPS[id].sell * n;
+    }
+    for (const [id, n] of Object.entries(u.inv.fish || {})) {
+      if (typeof n === 'number' && n > 0 && FISH[id]) base += FISH[id].sell * n;
+    }
+    for (const [id, n] of Object.entries(u.inv.products || {})) {
+      if (typeof n === 'number' && n > 0 && PRODUCTS[id]) base += PRODUCTS[id].sell * n;
+    }
+    const bonus = bonuses(now).sell || 0;
     const total = Math.floor(base * (1 + bonus));
     u.inv = { crops: {}, fish: {}, products: {} };
     u.riel += total;
-    saveSoon();
+    saveNow();
     return send(res, 200, { ...view(u, now), sold: total, bonus });
   }
 
@@ -458,19 +682,19 @@ async function api(req, res, url) {
     if (u.riel < step.price) return fail(res, 402, 'not_enough_riel');
     u.riel -= step.price;
     while (u.plots.length < step.plots) u.plots.push(null);
-    saveSoon();
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
   if (route === 'POST /api/shop/fertilizer') {
     const b = await readJson(req);
-    const qty = Number(b.qty);
+    const qty = typeof b.qty === 'number' ? b.qty : Number(b.qty);
     if (!isInt(qty, 1, 20)) return fail(res, 400, 'bad_qty');
     const cost = SHOP.fertPrice * qty;
     if (u.riel < cost) return fail(res, 402, 'not_enough_riel');
     u.riel -= cost;
     u.fert += qty;
-    saveSoon();
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
@@ -481,13 +705,14 @@ async function api(req, res, url) {
     if (u.riel < up.price) return fail(res, 402, 'not_enough_riel');
     u.riel -= up.price;
     u.canLevel += 1;
-    saveSoon();
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
   /* ---- decorations ---- */
   if (route === 'POST /api/decor/buy') {
     const b = await readJson(req);
+    if (typeof b.id !== 'string') return fail(res, 400, 'bad_item');
     const d = DECOR[b.id];
     if (!d) return fail(res, 400, 'bad_item');
     if (d.event && !eventItemAvailable(d.id, now)) return fail(res, 403, 'event_only');
@@ -495,28 +720,29 @@ async function api(req, res, url) {
     if (u.riel < d.price) return fail(res, 402, 'not_enough_riel');
     u.riel -= d.price;
     u.decor.owned[d.id] = (u.decor.owned[d.id] || 0) + 1;
-    saveSoon();
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
   if (route === 'POST /api/decor/place') {
     const b = await readJson(req);
     if (!isInt(b.slot, 0, YARD_SLOTS - 1)) return fail(res, 400, 'bad_slot');
-    if (b.id === null || b.id === undefined) {
+    if (b.id === null || b.id === undefined || b.id === '') {
       u.decor.placed[b.slot] = null;
     } else {
-      if (!DECOR[b.id]) return fail(res, 400, 'bad_item');
+      if (typeof b.id !== 'string' || !DECOR[b.id]) return fail(res, 400, 'bad_item');
       const free = (u.decor.owned[b.id] || 0) - placedCount(u, b.id, b.slot);
       if (free < 1) return fail(res, 409, 'not_owned');
       u.decor.placed[b.slot] = b.id;
     }
-    saveSoon();
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
   /* ---- animals ---- */
   if (route === 'POST /api/animals/buy') {
     const b = await readJson(req);
+    if (typeof b.type !== 'string') return fail(res, 400, 'bad_animal');
     const a = ANIMALS[b.type];
     if (!a) return fail(res, 400, 'bad_animal');
     if (u.animals.length >= PEN_CAP) return fail(res, 409, 'pen_full');
@@ -524,7 +750,7 @@ async function api(req, res, url) {
     if (u.riel < a.price) return fail(res, 402, 'not_enough_riel');
     u.riel -= a.price;
     u.animals.push({ type: a.id, readyAt: null });
-    saveSoon();
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
@@ -534,10 +760,12 @@ async function api(req, res, url) {
     if (!an) return fail(res, 400, 'bad_animal');
     if (an.readyAt !== null) return fail(res, 409, 'not_hungry');
     const def = ANIMALS[an.type];
+    if (!def) return fail(res, 400, 'bad_animal');
     if (u.riel < def.feed) return fail(res, 402, 'not_enough_riel');
     u.riel -= def.feed;
-    an.readyAt = now + Math.round(def.time * SPEED);
-    saveSoon();
+    const dur = Math.round(def.time * SPEED);
+    an.readyAt = now + dur;
+    saveNow();
     return send(res, 200, view(u, now));
   }
 
@@ -546,12 +774,15 @@ async function api(req, res, url) {
     const an = isInt(b.index, 0, u.animals.length - 1) ? u.animals[b.index] : null;
     if (!an) return fail(res, 400, 'bad_animal');
     if (an.readyAt === null || now < an.readyAt) return fail(res, 409, 'not_ready');
-    const prod = PRODUCTS[ANIMALS[an.type].product];
+    const def = ANIMALS[an.type];
+    if (!def) return fail(res, 400, 'bad_animal');
+    const prod = PRODUCTS[def.product];
+    if (!prod) return fail(res, 500, 'corrupt_product');
     if (prod.fertilizer) u.fert += 1;
     else u.inv.products[prod.id] = (u.inv.products[prod.id] || 0) + 1;
     u.xp += 2;
     an.readyAt = null;
-    saveSoon();
+    saveNow();
     return send(res, 200, { ...view(u, now), product: prod.id });
   }
 
@@ -562,6 +793,7 @@ async function api(req, res, url) {
 
   if (route === 'POST /api/event/claim') {
     const b = await readJson(req);
+    if (typeof b.event !== 'string') return fail(res, 404, 'no_such_event');
     const ev = EVENTS.find((e) => e.id === b.event);
     if (!ev) return fail(res, 404, 'no_such_event');
     if (!eventStatus(ev, now).active) return fail(res, 409, 'event_not_active');
@@ -570,7 +802,7 @@ async function api(req, res, url) {
     u.gifts[ev.id] = today;
     u.riel += ev.giftRiel || 0;
     u.fert += 1;
-    saveSoon();
+    saveNow();
     return send(res, 200, { ...view(u, now), gift: { riel: ev.giftRiel || 0, fert: 1 } });
   }
 
@@ -578,23 +810,30 @@ async function api(req, res, url) {
   if (route === 'POST /api/fish/cast') {
     const delay = FISH_MIN_DELAY + Math.floor(Math.random() * (FISH_MAX_DELAY - FISH_MIN_DELAY));
     u.fish = { biteAt: now + delay };
+    saveNow();
     return send(res, 200, { delay, window: FISH_WINDOW });
   }
 
   if (route === 'POST /api/fish/reel') {
     const f = u.fish;
     u.fish = null;
-    if (!f) return fail(res, 409, 'not_fishing');
-    if (now < f.biteAt) return send(res, 200, { result: 'early' });
-    if (now > f.biteAt + FISH_WINDOW + FISH_LATENCY_SLACK) return send(res, 200, { result: 'missed' });
-    const luck = bonuses(now).fishLuck;
+    if (!f || typeof f.biteAt !== 'number') return fail(res, 409, 'not_fishing');
+    if (now < f.biteAt) {
+      saveNow();
+      return send(res, 200, { result: 'early' });
+    }
+    if (now > f.biteAt + FISH_WINDOW + FISH_LATENCY_SLACK) {
+      saveNow();
+      return send(res, 200, { result: 'missed' });
+    }
+    const luck = bonuses(now).fishLuck || 1;
     const weight = (x) => (x.id === 'riel' ? x.weight : x.weight * luck);
     const total = Object.values(FISH).reduce((a, x) => a + weight(x), 0);
     let roll = Math.random() * total, caught = FISH.riel;
     for (const x of Object.values(FISH)) { if ((roll -= weight(x)) < 0) { caught = x; break; } }
     u.inv.fish[caught.id] = (u.inv.fish[caught.id] || 0) + 1;
     u.xp += 1;
-    saveSoon();
+    saveNow();
     return send(res, 200, { result: 'caught', fish: caught.id, me: view(u, now) });
   }
 
@@ -602,32 +841,40 @@ async function api(req, res, url) {
   if (route === 'GET /api/friends') {
     const list = u.friends.map((n) => db.users[n]).filter(Boolean).map((f) => ({
       username: f.username, name: f.name, look: f.look, level: levelFor(f.xp),
-      online: now - f.lastSeen < 30000,
+      online: now - (f.lastSeen || 0) < 30000,
     }));
     return send(res, 200, { friends: list });
   }
 
   if (route === 'POST /api/friends') {
     const b = await readJson(req);
-    const name = String(b.username || '').toLowerCase();
+    const raw = typeof b.username === 'string' ? b.username : '';
+    const name = raw.toLowerCase().trim();
+    if (!/^[a-z0-9_]{3,16}$/.test(name)) return fail(res, 400, 'bad_username');
     if (!db.users[name]) return fail(res, 404, 'user_not_found');
     if (name === u.username) return fail(res, 400, 'cannot_add_self');
     if (u.friends.includes(name)) return fail(res, 409, 'already_friends');
     if (u.friends.length >= 100) return fail(res, 400, 'too_many_friends');
     u.friends.push(name);
-    saveSoon();
+    saveNow();
     return send(res, 200, { ok: true });
   }
 
   if (route === 'POST /api/friends/remove') {
     const b = await readJson(req);
-    u.friends = u.friends.filter((n) => n !== String(b.username || '').toLowerCase());
-    saveSoon();
+    const raw = typeof b.username === 'string' ? b.username : '';
+    const name = raw.toLowerCase().trim();
+    u.friends = u.friends.filter((n) => n !== name);
+    saveNow();
     return send(res, 200, { ok: true });
   }
 
   if (req.method === 'GET' && url.pathname.startsWith('/api/farm/')) {
-    const name = decodeURIComponent(url.pathname.slice('/api/farm/'.length)).toLowerCase();
+    const raw = url.pathname.slice('/api/farm/'.length);
+    let name = '';
+    try { name = decodeURIComponent(raw).toLowerCase().trim(); }
+    catch { return fail(res, 400, 'bad_username'); }
+    if (!/^[a-z0-9_]{3,16}$/.test(name)) return fail(res, 400, 'bad_username');
     const f = db.users[name];
     if (!f || !u.friends.includes(name)) return fail(res, 404, 'user_not_found');
     return send(res, 200, {
@@ -642,7 +889,7 @@ async function api(req, res, url) {
   /* ---- chat (one global room) ---- */
   if (route === 'GET /api/chat') {
     const since = Number(url.searchParams.get('since')) || 0;
-    const online = Object.values(db.users).filter((x) => now - x.lastSeen < 30000).length;
+    const online = Object.values(db.users).filter((x) => now - (x.lastSeen || 0) < 30000).length;
     return send(res, 200, { messages: db.chat.filter((m) => m.id > since), online });
   }
 
@@ -650,11 +897,11 @@ async function api(req, res, url) {
     const b = await readJson(req);
     const text = cleanText(b.text, 200);
     if (!text) return fail(res, 400, 'empty');
-    if (now - u.lastChat < 1000) return fail(res, 429, 'rate_limited');
+    if (now - (u.lastChat || 0) < 1000) return fail(res, 429, 'rate_limited');
     u.lastChat = now;
     db.chat.push({ id: ++db.chatSeq, user: u.username, name: u.name, text, t: now });
     if (db.chat.length > 100) db.chat.splice(0, db.chat.length - 100);
-    saveSoon();
+    saveNow();
     return send(res, 200, { ok: true });
   }
 
@@ -676,7 +923,7 @@ function serveStatic(req, res, url) {
   let rel;
   try { rel = decodeURIComponent(url.pathname); } catch { return fail(res, 400, 'bad_path'); }
   if (rel.includes('\0')) return fail(res, 400, 'bad_path');
-  if (rel === '/') rel = '/index.html';
+  if (rel === '/' || rel === '') rel = '/index.html';
   const file = path.normalize(path.join(PUBLIC_DIR, rel));
   if (file !== PUBLIC_DIR && !file.startsWith(PUBLIC_DIR + path.sep)) return fail(res, 403, 'forbidden');
   fs.readFile(file, (err, data) => {
@@ -692,15 +939,17 @@ function serveStatic(req, res, url) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Server                                                              */
+/* Server & Request Handler                                            */
 /* ------------------------------------------------------------------ */
 loadDb();
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   try {
-    const url = new URL(req.url, 'http://localhost');
+    const rawUrl = req.headers['x-forwarded-url'] || req.url || '/';
+    const url = new URL(rawUrl, 'http://localhost');
     if (url.pathname.startsWith('/api/')) {
       if (rateLimited('api:' + clientIp(req), 300, 60000)) return fail(res, 429, 'rate_limited');
+      maybeReloadDb();
       return await api(req, res, url);
     }
     serveStatic(req, res, url);
@@ -710,13 +959,33 @@ const server = http.createServer(async (req, res) => {
     console.error(e);
     fail(res, 500, 'server_error');
   }
-});
+}
 
-server.listen(PORT, () => {
-  const on = activeEvents(Date.now()).map((e) => e.id);
-  console.log(`Srok Srae running on http://localhost:${PORT}  (growth x${(1 / SPEED).toFixed(1)}, active events: ${on.join(', ') || 'none'})`);
-});
+const server = http.createServer(handleRequest);
+
+if (require.main === module) {
+  server.listen(PORT, () => {
+    const on = activeEvents(Date.now()).map((e) => e.id);
+    console.log(`Srok Srae running on http://localhost:${PORT}  (growth x${(1 / SPEED).toFixed(1)}, active events: ${on.join(', ') || 'none'})`);
+  });
+}
 
 for (const sig of ['SIGINT', 'SIGTERM']) {
   process.on(sig, () => { saveNow(); process.exit(0); });
 }
+
+module.exports = {
+  server,
+  handleRequest,
+  api,
+  db,
+  ensureUser,
+  loadDb,
+  saveNow,
+  CROPS,
+  FISH,
+  SHOP,
+  DECOR,
+  ANIMALS,
+  PRODUCTS,
+};
