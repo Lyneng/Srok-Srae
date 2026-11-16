@@ -53,6 +53,28 @@ input[type=text], input[type=password] {
   width: 100%; padding: 10px 12px; border-radius: 10px; border: 2px solid #d9d2c0; background: #fff;
 }
 input:focus { outline: none; border-color: var(--green); }
+.remember-row {
+  display: flex;
+  align-items: center;
+  margin-top: 10px;
+  font-size: 0.95rem;
+  color: var(--muted);
+  user-select: none;
+}
+.remember-row label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  cursor: pointer;
+  font-weight: normal;
+}
+.remember-row input[type=checkbox] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--green);
+  cursor: pointer;
+}
 .btn {
   display: inline-block; width: 100%; padding: 12px; margin-top: 14px;
   border: none; border-radius: 12px; background: var(--green); color: #fff;

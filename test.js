@@ -31,7 +31,7 @@ process.env.DATA_FILE = DATA_FILE;
 process.env.GROWTH_SPEED = '0.01';
 process.env.FORCE_EVENT = 'water_festival';
 
-const { handleRequest, loadDb, saveNow } = require('./server.js');
+const { handleRequest, loadDb, saveNow, db } = require('./server.js');
 loadDb();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -348,6 +348,22 @@ async function call(method, url, body, token) {
   check('logout succeeds', r.status === 200 && r.data.ok === true);
   r = await call('GET', '/api/me', undefined, tokA);
   check('logout invalidates token', r.status === 401);
+
+  console.log('cold-start client vault recovery');
+  const daraBackup = {
+    username: 'dara',
+    salt: saved.users.dara.salt,
+    hash: saved.users.dara.hash,
+    riel: 555,
+    xp: 200,
+  };
+  delete db.users.dara;
+  r = await call('POST', '/api/login', { username: 'dara', password: 'wrongpassword', backup: daraBackup });
+  check('cold start rejects wrong password', r.status === 401);
+  r = await call('POST', '/api/login', { username: 'dara', password: 'secret1', backup: daraBackup });
+  check('cold start restores user and gameplay state', r.status === 200 && r.data.me.riel === 555 && r.data.me.xp === 200);
+  r = await call('GET', '/api/me', undefined, r.data.token);
+  check('restored user can call authenticated endpoints', r.status === 200 && r.data.riel === 555);
 
   console.log(`\nAll ${passed} checks passed successfully.`);
   process.exit(0);

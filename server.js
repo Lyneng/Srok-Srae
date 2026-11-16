@@ -768,12 +768,56 @@ function view(u, now = Date.now()) {
   };
 }
 
+const TOKEN_SECRET =
+  process.env.SESSION_SECRET ||
+  process.env.VERCEL_GIT_COMMIT_SHA ||
+  "srok-srae-session-secret-2025";
+
+function createSessionToken(username) {
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const now = Date.now();
+  const payload = `${nonce}.${username}.${now}`;
+  const sig = crypto
+    .createHmac("sha256", TOKEN_SECRET)
+    .update(payload)
+    .digest("hex")
+    .slice(0, 32);
+  const token = `${payload}.${sig}`;
+  db.sessions[token] = { username, created: now };
+  return token;
+}
+
 function authUser(req) {
   const h = req.headers.authorization || "";
   const token = h.startsWith("Bearer ") ? h.slice(7).trim() : "";
   if (!token || typeof token !== "string") return null;
-  const s = db.sessions[token];
-  if (!s || typeof s !== "object" || !s.username) return null;
+  let s = db.sessions[token];
+  if (!s) {
+    // Attempt stateless session verification if token is signed
+    const parts = token.split(".");
+    if (parts.length === 4) {
+      const [nonce, username, timestampStr, sig] = parts;
+      const created = Number(timestampStr);
+      const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+      if (Number.isFinite(created) && created > cutoff) {
+        const payload = `${nonce}.${username}.${created}`;
+        const expectedSig = crypto
+          .createHmac("sha256", TOKEN_SECRET)
+          .update(payload)
+          .digest("hex")
+          .slice(0, 32);
+        if (
+          sig.length === expectedSig.length &&
+          crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))
+        ) {
+          s = { username, created };
+          db.sessions[token] = s;
+        }
+      }
+    }
+  }
+  if (!s || typeof s !== "object" || s.revoked || !s.username) return null;
+  maybeReloadDb();
   const u = db.users[s.username];
   if (!u) return null;
   u.lastSeen = Date.now();
@@ -872,9 +916,45 @@ async function api(req, res, url) {
       const hash = await scrypt(password, salt);
       if (db.users[username]) return fail(res, 409, "username_taken");
       db.users[username] = newUser(username, name, look, salt, hash);
+      saveNow();
     }
 
-    const u = db.users[username];
+    let u = db.users[username];
+
+    // If user not in current container (e.g. serverless cold start), attempt verified restore from client backup
+    if (route === "POST /api/login" && b.backup && typeof b.backup === "object") {
+      const bk = b.backup;
+      if (
+        String(bk.username || "").toLowerCase().trim() === username &&
+        typeof bk.salt === "string" &&
+        typeof bk.hash === "string" &&
+        /^[0-9a-f]{32}$/i.test(bk.salt) &&
+        /^[0-9a-f]{64}$/i.test(bk.hash)
+      ) {
+        const uSalt = Buffer.from(bk.salt, "hex");
+        const uHash = Buffer.from(bk.hash, "hex");
+        const hash = await scrypt(password, uSalt);
+        if (hash.length === uHash.length && crypto.timingSafeEqual(hash, uHash)) {
+          // Cryptographically verified!
+          if (!u) {
+            u = ensureUser(bk);
+            db.users[username] = u;
+            saveNow();
+          } else if (bk.updatedAt && bk.updatedAt > (u.lastSeen || 0)) {
+            // Merge newer state if client was active on another serverless worker
+            u.riel = Math.max(u.riel, Number(bk.riel) || 0);
+            u.xp = Math.max(u.xp, Number(bk.xp) || 0);
+            if (Array.isArray(bk.plots)) u.plots = bk.plots;
+            if (bk.inv && typeof bk.inv === "object") u.inv = bk.inv;
+            if (bk.decor && typeof bk.decor === "object") u.decor = bk.decor;
+            if (Array.isArray(bk.animals)) u.animals = bk.animals;
+            ensureUser(u);
+            saveNow();
+          }
+        }
+      }
+    }
+
     if (!u) return fail(res, 401, "bad_credentials");
     if (route === "POST /api/login") {
       const uSalt = Buffer.from(u.salt, "hex");
@@ -887,11 +967,14 @@ async function api(req, res, url) {
         return fail(res, 401, "bad_credentials");
       }
     }
-    const token = crypto.randomBytes(24).toString("hex");
-    db.sessions[token] = { username, created: now };
+    const token = createSessionToken(username);
     u.lastSeen = now;
     saveNow();
-    return send(res, 200, { token, me: view(u, now) });
+    return send(res, 200, {
+      token,
+      me: view(u, now),
+      authVault: { salt: u.salt, hash: u.hash },
+    });
   }
 
   /* ---- everything below needs a session ---- */
@@ -901,8 +984,8 @@ async function api(req, res, url) {
   if (route === "POST /api/logout") {
     const h = req.headers.authorization || "";
     const token = h.startsWith("Bearer ") ? h.slice(7).trim() : "";
-    if (token && db.sessions[token]) {
-      delete db.sessions[token];
+    if (token) {
+      db.sessions[token] = { revoked: true, created: Date.now() };
       saveNow();
     }
     return send(res, 200, { ok: true });

@@ -17,6 +17,7 @@
       title: 'ស្រុកស្រែ', tagline: 'ភូមិកសិកម្មរបស់យើង',
       login: 'ចូលគណនី', register: 'បង្កើតគណនី', logout: 'ចាកចេញ',
       username: 'ឈ្មោះអ្នកប្រើ', password: 'ពាក្យសម្ងាត់', displayName: 'ឈ្មោះតួអង្គ',
+      rememberMe: 'ចងចាំគណនី និងពាក្យសម្ងាត់',
       appearance: 'រូបរាង', skin: 'ស្បែក', hair: 'សក់', outfit: 'ក្រមា',
       start: 'ចាប់ផ្ដើម', level: 'កម្រិត', riel: 'រៀល',
       tab_farm: 'ចម្ការ', tab_fish: 'ស្ទូចត្រី', tab_village: 'ភូមិ', tab_shop: 'ហាង', tab_social: 'មិត្ត',
@@ -72,6 +73,7 @@
       title: 'Srok Srae', tagline: 'Our countryside village',
       login: 'Log in', register: 'Create account', logout: 'Log out',
       username: 'Username', password: 'Password', displayName: 'Character name',
+      rememberMe: 'Remember username & password',
       appearance: 'Appearance', skin: 'Skin', hair: 'Hair', outfit: 'Krama',
       start: 'Start', level: 'Level', riel: 'Riel',
       tab_farm: 'Farm', tab_fish: 'Fishing', tab_village: 'Village', tab_shop: 'Shop', tab_social: 'Social',
@@ -128,10 +130,16 @@
   /* ------------------------------------------------------------------ */
   /* state                                                               */
   /* ------------------------------------------------------------------ */
+  let savedCreds = null;
+  try {
+    savedCreds = JSON.parse(localStorage.getItem('srok_saved_creds') || 'null');
+  } catch {}
+
   const S = {
     cfg: null,
     token: localStorage.getItem('token') || '',
     lang: localStorage.getItem('lang') || 'km',
+    remember: localStorage.getItem('srok_remember') !== '0',
     me: null,
     offset: 0,
     tab: 'farm',
@@ -139,7 +147,11 @@
     seed: 'rice',          // selected seed id, or 'fert'
     pick: null,            // selected decoration id, or '__remove'
     authMode: 'login',
-    form: { username: '', password: '', name: '' },
+    form: {
+      username: (savedCreds && savedCreds.username) || localStorage.getItem('last_user') || '',
+      password: (savedCreds && savedCreds.password) || '',
+      name: '',
+    },
     look: { skin: 1, hair: 0, outfit: 0 },
     busy: false,
     events: [],
@@ -197,11 +209,39 @@
     toastTimer = setTimeout(() => el.classList.remove('show'), 2000);
   }
 
-  function setMe(me) {
+  function saveVault(u, authVault) {
+    if (!u || !u.username) return;
+    try {
+      const key = 'srok_vault_' + u.username.toLowerCase();
+      let existing = {};
+      try { existing = JSON.parse(localStorage.getItem(key)) || {}; } catch {}
+      const merged = {
+        ...existing,
+        ...u,
+        ...(authVault || {}),
+        updatedAt: Date.now(),
+      };
+      localStorage.setItem(key, JSON.stringify(merged));
+      localStorage.setItem('last_user', u.username.toLowerCase());
+    } catch {}
+  }
+
+  function getVault(username) {
+    if (!username) return null;
+    try {
+      const raw = localStorage.getItem('srok_vault_' + username.toLowerCase().trim());
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function setMe(me, authVault) {
     const before = S.me ? S.me.level : null;
     S.me = me;
     S.offset = me.serverNow - Date.now();
     if (before !== null && me.level > before) toast('🎉 ' + t('levelUp'));
+    saveVault(me, authVault);
   }
 
   /* ------------------------------------------------------------------ */
@@ -267,6 +307,12 @@
             <input id="f_user" name="username" type="text" autocapitalize="none" autocomplete="username" maxlength="16" value="${esc(S.form.username)}" required>
             <label for="f_pass">${t('password')}</label>
             <input id="f_pass" name="password" type="password" autocomplete="${reg ? 'new-password' : 'current-password'}" maxlength="72" value="${esc(S.form.password)}" required>
+            <div class="remember-row">
+              <label for="f_remember">
+                <input id="f_remember" type="checkbox" ${S.remember ? 'checked' : ''}>
+                <span>${t('rememberMe')}</span>
+              </label>
+            </div>
             ${reg ? `
               <label for="f_name">${t('displayName')}</label>
               <input id="f_name" name="name" type="text" maxlength="16" value="${esc(S.form.name)}">
@@ -292,15 +338,55 @@
     const reg = S.authMode === 'register';
     const err = $('#authErr');
     err.textContent = '';
+    const userEl = $('#f_user');
+    const passEl = $('#f_pass');
+    const nameEl = $('#f_name');
+    const username = (userEl ? userEl.value : S.form.username || '').trim();
+    const password = passEl ? passEl.value : S.form.password || '';
+
+    const rememberEl = $('#f_remember');
+    const rememberMe = rememberEl ? rememberEl.checked : S.remember;
+    S.remember = rememberMe;
+    try { localStorage.setItem('srok_remember', rememberMe ? '1' : '0'); } catch {}
+    if (rememberMe) {
+      try {
+        localStorage.setItem(
+          'srok_saved_creds',
+          JSON.stringify({ username, password })
+        );
+      } catch {}
+    } else {
+      try { localStorage.removeItem('srok_saved_creds'); } catch {}
+    }
+
     try {
-      const body = { username: S.form.username.trim(), password: S.form.password };
-      if (reg) { body.name = S.form.name.trim(); body.look = S.look; }
+      const body = { username, password };
+      if (reg) {
+        body.name = (nameEl ? nameEl.value : S.form.name || '').trim();
+        body.look = S.look;
+      } else {
+        const vault = getVault(username);
+        if (vault) body.backup = vault;
+      }
       const r = await api(reg ? '/api/register' : '/api/login', body);
       S.token = r.token;
       localStorage.setItem('token', S.token);
-      S.form.password = '';
+      S.form.username = username;
+      S.form.password = rememberMe ? password : '';
       S.authMode = 'login';
-      setMe(r.me);
+      setMe(r.me, r.authVault);
+
+      if (window.PasswordCredential && navigator.credentials && navigator.credentials.store) {
+        try {
+          const cred = new window.PasswordCredential({
+            id: username,
+            password: password,
+            name: reg && body.name ? body.name : username,
+          });
+          navigator.credentials.store(cred).catch(() => {});
+        } catch {}
+      }
+
       enterGame();
     } catch (ex) {
       err.textContent = errText(ex) + (ex.message === 'username_taken' ? ' — ' + t('tryLogin') : '');
@@ -339,8 +425,20 @@
   function forceLogout() {
     stopLoops();
     S.token = '';
+    const lastUser = (S.me && S.me.username) || S.form.username || localStorage.getItem('last_user') || '';
     S.me = null;
     S.authMode = 'login';   // always return to the login tab (not "create account")
+    S.form.username = lastUser;
+    if (S.remember) {
+      try {
+        const sc = JSON.parse(localStorage.getItem('srok_saved_creds') || '{}');
+        S.form.password = sc.password || '';
+      } catch {
+        S.form.password = '';
+      }
+    } else {
+      S.form.password = '';
+    }
     localStorage.removeItem('token');
     renderAuth();
   }
@@ -1050,7 +1148,16 @@
     }
     if (el.id === 'langBtn') return switchLang();
     if (el.id === 'logoutBtn') return logout();
-    if (d.mode) { S.authMode = d.mode; return renderAuth(); }
+    if (d.mode) {
+      const uEl = $('#f_user');
+      const pEl = $('#f_pass');
+      const rEl = $('#f_remember');
+      if (uEl) S.form.username = uEl.value;
+      if (pEl) S.form.password = pEl.value;
+      if (rEl) S.remember = rEl.checked;
+      S.authMode = d.mode;
+      return renderAuth();
+    }
     if (d.look) {
       S.look[d.look] = Number(d.i);
       $('#preview').innerHTML = avatar(S.look, 96);
@@ -1093,6 +1200,13 @@
     if (e.target.id === 'f_name') S.form.name = e.target.value;
   });
 
+  document.addEventListener('change', (e) => {
+    if (e.target.id === 'f_remember') {
+      S.remember = e.target.checked;
+      try { localStorage.setItem('srok_remember', S.remember ? '1' : '0'); } catch {}
+    }
+  });
+
   document.addEventListener('submit', async (e) => {
     if (e.target.id === 'authForm') return submitAuth(e);
     e.preventDefault();
@@ -1129,9 +1243,30 @@
       return;
     }
     if (S.token) {
-      try { setMe(await api('/api/me')); enterGame(); return; }
-      catch { S.token = ''; localStorage.removeItem('token'); }
+      try {
+        setMe(await api('/api/me'));
+        enterGame();
+        return;
+      } catch {
+        if (S.form.username && S.form.password) {
+          try {
+            const vault = getVault(S.form.username);
+            const body = { username: S.form.username, password: S.form.password };
+            if (vault) body.backup = vault;
+            const r = await api('/api/login', body);
+            S.token = r.token;
+            localStorage.setItem('token', S.token);
+            setMe(r.me, r.authVault);
+            enterGame();
+            return;
+          } catch { /* proceed to renderAuth */ }
+        }
+        S.token = '';
+        localStorage.removeItem('token');
+      }
     }
+    const lastUser = localStorage.getItem('last_user');
+    if (lastUser) S.form.username = lastUser;
     renderAuth();
   }
 
