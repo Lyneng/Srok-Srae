@@ -53,6 +53,7 @@
       err_bad_username: 'ឈ្មោះអ្នកប្រើត្រូវមាន ៣-១៦ តួ (a-z, 0-9, _)',
       err_bad_password: 'ពាក្យសម្ងាត់ត្រូវមានយ៉ាងតិច ៦ តួ',
       err_username_taken: 'ឈ្មោះនេះមានគេប្រើហើយ',
+      tryLogin: 'បើជាគណនីរបស់អ្នក សូមចុច «ចូលគណនី»',
       err_bad_credentials: 'ឈ្មោះ ឬពាក្យសម្ងាត់មិនត្រឹមត្រូវ',
       err_rate_limited: 'សូមរង់ចាំបន្តិច',
       err_not_enough_riel: 'រៀលមិនគ្រប់គ្រាន់',
@@ -107,6 +108,7 @@
       err_bad_username: 'Username must be 3-16 characters (a-z, 0-9, _)',
       err_bad_password: 'Password must be at least 6 characters',
       err_username_taken: 'That username is taken',
+      tryLogin: 'If this is your account, tap "Log in" instead',
       err_bad_credentials: 'Wrong username or password',
       err_rate_limited: 'Slow down a little',
       err_not_enough_riel: 'Not enough riel',
@@ -297,10 +299,11 @@
       S.token = r.token;
       localStorage.setItem('token', S.token);
       S.form.password = '';
+      S.authMode = 'login';
       setMe(r.me);
       enterGame();
     } catch (ex) {
-      err.textContent = errText(ex);
+      err.textContent = errText(ex) + (ex.message === 'username_taken' ? ' — ' + t('tryLogin') : '');
     }
   }
 
@@ -337,6 +340,7 @@
     stopLoops();
     S.token = '';
     S.me = null;
+    S.authMode = 'login';   // always return to the login tab (not "create account")
     localStorage.removeItem('token');
     renderAuth();
   }
